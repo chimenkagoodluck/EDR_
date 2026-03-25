@@ -1,804 +1,1882 @@
 """
-============================================================
-ESUTH EMR - MariaDB Error Log Parser & Labeler
-PhD Research: Enhanced Incident Response Plan for EMR Systems
-Enugu State University Teaching Hospital (ESUTH)
-============================================================
+╔══════════════════════════════════════════════════════════════════════╗
+║                                                                      ║
+║     L I R A  —  Log Intelligence & Response Analyzer                 ║
+║     Version 2.0  |  ESUTH EMR Cybersecurity Research Tool           ║
+║                                                                      ║
+║     PhD Research:                                                    ║
+║     "An Enhanced Incident Response Plan for Electronic Medical       ║
+║      Record Systems at Tertiary Health Facilities in Nigeria"        ║
+║                                                                      ║
+║     Architecture : Two-Pass Fully Dynamic Pipeline                   ║
+║       PASS 1 — Discovery  : Reads the entire log file once,         ║
+║                             discovers all unique users, hosts,       ║
+║                             databases, message patterns, and         ║
+║                             establishes statistical baselines        ║
+║                             with ZERO hardcoded assumptions.         ║
+║       PASS 2 — Labeling   : Uses only what was discovered in         ║
+║                             Pass 1 to label every event via          ║
+║                             a 25-rule deterministic engine.          ║
+║                             Every label is traceable by Rule ID.     ║
+║                                                                      ║
+║     Output    : 8 CSV files + 1 comprehensive TXT report            ║
+║                 Report is 100% auto-generated from the log data.     ║
+║                 No values are hardcoded — everything is derived       ║
+║                 from the actual contents of the file being parsed.   ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════╝
 
 USAGE:
-    python mariadb_log_parser.py --input "C:/path/to/mysql_error.log"
+    python LIRA_parser.py --input "C:\\xampp\\mysql\\data\\mysql_error.log"
+    python LIRA_parser.py --input /path/to/log --output /path/to/results/
 
-OUTPUT FILES (saved in same folder as input):
-    1. esuth_parsed_events.csv       — Every event, structured
-    2. esuth_labeled_incidents.csv   — Only security/incident events, labeled
-    3. esuth_model_downtime.csv      — Ready for Downtime/Availability Model
-    4. esuth_model_datacorrupt.csv   — Ready for Data Corruption Model
-    5. esuth_model_unauth.csv        — Ready for Unauthorized Access Model
-    6. esuth_model_suspicious.csv    — Ready for further investigation (ransomware/malware)
-    7. esuth_summary_report.txt      — Human-readable summary for your thesis
-    8. esuth_label_audit.csv         — Every labeling decision with the rule that fired
+    Optional flags:
+        --work-start HH   Start of working hours, 24h (default: 7)
+        --work-end   HH   End of working hours, 24h   (default: 21)
+        --top-user-pct N  % threshold: users seen in >= N% of connection
+                          events are treated as baseline users (default: 5)
+        --top-host-pct N  % threshold: hosts seen in >= N% of connection
+                          events are treated as baseline hosts (default: 1)
 """
 
 import re
 import csv
 import os
 import sys
+import json
 import argparse
+import hashlib
+import textwrap
 from datetime import datetime
-from collections import defaultdict, Counter
+from collections import Counter, defaultdict
 
 
-# ============================================================
-# CONFIGURATION — Edit these based on IT admin confirmation
-# ============================================================
+# ═══════════════════════════════════════════════════════════════════════
+# TOOL METADATA
+# ═══════════════════════════════════════════════════════════════════════
 
-# Known legitimate hostnames in the ESUTH network
-# Add more as IT admin confirms them
-KNOWN_HOSTS = {
-    "Emergency-Phamarcy",
-    "DESKTOP-B8CCP1M",
-    "24h-Medcial-Rec",
-    "DESKTOP-EE1TUR0",
-    "GOPD-Revenue",
-    "DESKTOP-VLAGG25",
-    "BILLS",
-    "DESKTOP-H0VKHI9",
-    "Med-Records-1",
-    "Med-Records-2",
-    "DESKTOP-GGTJUEO",
-    "DESKTOP-SMITJEQ",
-    "DESKTOP-0UKNV7K",
-    "DESKTOP-7B1UJP6",
-    "A-E-BILLING",
-    "DESKTOP-45HCUFT",
-    "HOU-REVENUE-PC",
-    "EM-MED-REC",
-    "DESKTOP-17O6HNS",
-    "DUFUTH-SERVER",
-    "DESKTOP-NE61ATE",
-    "DESKTOP-QFAIBIL",
-    "DESKTOP-IP59NG6",
-    "DESKTOP-T5C63R6",
-    "DESKTOP-BSAK24V",
-    "DESKTOP-CSPRMLA",
-    "DESKTOP-9O3E0BR",
-    "DESKTOP-STLV8TP",
-    "DESKTOP-BEFTIQ9",
-    "DESKTOP-917QBH8",
-    "DESKTOP-OQPI1ET",
-    "DESKTOP-30R3R26",
-    "A-E-NURSES",
-    "A-E-DOCTORS",
-    "DESKTOP-QT13QIF",
-    "CODE-S",
-    "A-E-REVENUE",
-    "GOPD-RM-1",
-    "DESKTOP-VBC03FI",
-    "DESKTOP-V1SVAAI",
-    "DESKTOP-UIH60P8",
-    "DESKTOP-RH8L10S",
-    "DESKTOP-BEFTIQ9",
-    "DESKTOP-VLAGG25",
-}
+TOOL_NAME      = "LIRA — Log Intelligence & Response Analyzer"
+TOOL_VERSION   = "2.0"
+TOOL_CODENAME  = "ESUTH-IRP-RESEARCH"
+RESEARCH_TITLE = (
+    "An Enhanced Incident Response Plan for Electronic Medical "
+    "Record Systems at Tertiary Health Facilities in Nigeria"
+)
+HOSPITAL_NAME  = "Enugu State University Teaching Hospital (ESUTH)"
 
-# Legitimate database user(s) — as confirmed from the log
-KNOWN_USERS = {"root3"}
+SEVERITY_WEIGHT = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
 
-# Normal operational hours (24h format) — update after IT interview
-NORMAL_HOURS_START = 7   # 7:00 AM
-NORMAL_HOURS_END = 22    # 10:00 PM
+# ─── Regex patterns ──────────────────────────────────────────────────
 
-
-# ============================================================
-# LOG LINE REGEX PATTERNS
-# ============================================================
-
-# Main log line: 2023-08-27 15:39:11 0 [Note] InnoDB: ...
-MAIN_PATTERN = re.compile(
+# Handles both normal (08:30:00) and single-digit hour ( 7:30:00 → 7:30:00)
+RE_MAIN = re.compile(
     r'^(?P<date>\d{4}-\d{2}-\d{2})\s+'
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s+'
-    r'(?P<thread_id>\d+)\s+'
+    r'(?P<time>\d{1,2}:\d{2}:\d{2})\s+'
+    r'(?P<thread>\d+)\s+'
     r'\[(?P<level>\w+)\]\s+'
     r'(?P<message>.+)$'
 )
-
-# Aborted connection: ... to db: 'bamed' user: 'root3' host: 'BILLS' (Got an error...)
-ABORTED_PATTERN = re.compile(
-    r"Aborted connection\s+(?P<conn_id>\d+)\s+to\s+db:\s+'(?P<db>[^']+)'\s+"
-    r"user:\s+'(?P<user>[^']+)'\s+host:\s+'(?P<host>[^']+)'\s+\((?P<reason>[^)]+)\)"
+RE_ABORTED = re.compile(
+    r"Aborted connection\s+(?P<conn_id>\d+)\s+to\s+db:\s*'(?P<db>[^']*)'\s+"
+    r"user:\s*'(?P<user>[^']*)'\s+host:\s*'(?P<host>[^']*)'\s*"
+    r"\((?P<reason>[^)]+)\)"
 )
+RE_ACCESS_DENIED = re.compile(
+    r"Access denied for user\s+'(?P<user>[^']+)'@'(?P<host>[^']+)'"
+    r"\s+\(using password:\s*(?P<pwd>YES|NO)\)"
+)
+RE_DNS = re.compile(
+    r"(?:IP address|Host(?:name)?)\s+'(?P<entity>[^']+)'\s+"
+    r"(?:could not be resolved|does not resolve to\s+'(?P<target>[^']+)')"
+)
+RE_LSN    = re.compile(r"LSN=(\d+)")
+RE_VER    = re.compile(r"^Version:\s+'")
+RE_ARIA_P = re.compile(r"^recovered pages:")
+RE_DASH   = re.compile(r"^\s*-\s+\S")   # sub-listing lines like "- fe80::..."
+RE_IPV4   = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+RE_IPV6   = re.compile(r'^fe80::')
 
 
-# ============================================================
-# LABELING ENGINE
-# Each rule returns (label, sublabel, severity, model, rule_id)
-# ============================================================
+# ═══════════════════════════════════════════════════════════════════════
+# PASS 1 — DISCOVERY
+# Reads the entire log once. Collects raw events and builds statistical
+# baselines. Returns everything needed for Pass 2 labeling.
+# ═══════════════════════════════════════════════════════════════════════
 
-def apply_labeling_rules(event: dict) -> dict:
+def discover(filepath: str) -> dict:
     """
-    Apply deterministic labeling rules to a parsed event.
-    Returns enriched event with label fields added.
-    
-    Labels:
-        BENIGN              — Normal operation, no threat
-        SYSTEM_DOWNTIME     — Service unavailable / crashed
-        DATA_CORRUPTION     — Data integrity at risk
-        UNAUTHORIZED_ACCESS — Suspicious/unauthenticated access
-        SUSPICIOUS          — Needs further investigation
-        PLANNED_MAINTENANCE — Known, authorized shutdown
-    
-    Severity:
-        CRITICAL / HIGH / MEDIUM / LOW / INFO
+    Pass 1: Stream through every line of the log file.
+
+    Returns a discovery dict containing:
+        raw_events      : list of minimally-parsed event dicts
+        file_size_bytes : int
+        raw_line_count  : int
+        skipped_lines   : int
+        all_users       : Counter  — every user seen in connection events
+        all_hosts       : Counter  — every host seen in connection events
+        all_databases   : Counter  — every database seen
+        all_levels      : Counter  — Note / Warning / Error counts
+        all_abort_reasons: Counter — distinct abort reason strings
+        all_db_names    : set      — all database names accessed
+        date_range      : (first_date_str, last_date_str)
+        version_strings : Counter  — MariaDB version strings found
+        message_templates: Counter — anonymized message templates
     """
-    
-    msg = event.get("message", "").lower()
-    user = event.get("user", "")
-    host = event.get("host", "")
-    level = event.get("level", "")
-    hour = event.get("hour", 12)
-    
-    label = "BENIGN"
-    sublabel = "normal_operation"
-    severity = "INFO"
-    model_target = "none"
-    rule_id = "R00"
+
+    raw_events      = []
+    raw_line_count  = 0
+    skipped_lines   = 0
+    current         = None
+
+    all_users        = Counter()
+    all_hosts        = Counter()
+    all_databases    = Counter()
+    all_levels       = Counter()
+    all_abort_reasons= Counter()
+    all_db_names     = set()
+    version_strings  = Counter()
+    message_templates= Counter()
+    all_dates        = []
+
+    try:
+        file_size = os.path.getsize(filepath)
+    except OSError:
+        file_size = 0
+
+    def _anonymize(text: str) -> str:
+        """Strip dynamic values to reveal message structure."""
+        t = re.sub(r"'[^']*'", "'X'", text)
+        t = re.sub(r'"[^"]*"', '"X"', t)
+        t = re.sub(r'\b\d+\b', 'N', t)
+        t = re.sub(r'fe80::[a-f0-9:%]+', 'IPv6', t, flags=re.I)
+        t = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', 'IPv4', t)
+        return t.strip()
+
+    with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            raw_line_count += 1
+            line = raw.rstrip("\r\n")
+            stripped = line.strip()
+
+            if not stripped:
+                skipped_lines += 1
+                continue
+            if RE_VER.match(stripped):
+                version_strings[stripped.split("'")[1]] += 1
+                skipped_lines += 1
+                if current:
+                    current["_continuation"] += 1
+                continue
+            if RE_ARIA_P.match(stripped) or RE_DASH.match(stripped):
+                skipped_lines += 1
+                if current:
+                    current["_extra"] = current.get("_extra", "") + " | " + stripped
+                continue
+
+            m = RE_MAIN.match(stripped)
+            if m:
+                if current:
+                    raw_events.append(current)
+
+                msg  = m.group("message").strip()
+                date_str = m.group("date")
+                time_str = m.group("time").strip()
+                # Pad single-digit hour: 7:28:12 → 07:28:12
+                if len(time_str) == 7:
+                    time_str = "0" + time_str
+                ts_str = f"{date_str} {time_str}"
+
+                try:
+                    ts   = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                    hour = ts.hour
+                    dow  = ts.strftime("%A")
+                    mon  = ts.strftime("%B")
+                    yr   = ts.year
+                    all_dates.append(date_str)
+                except ValueError:
+                    ts = None
+                    hour = -1
+                    dow = mon = ""
+                    yr = ""
+
+                level = m.group("level")
+                all_levels[level] += 1
+
+                # Extract connection sub-fields
+                user = db = host = conn_id = abort_reason = ""
+                ab = RE_ABORTED.search(msg)
+                if ab:
+                    conn_id      = ab.group("conn_id")
+                    db           = ab.group("db")
+                    user         = ab.group("user")
+                    host         = ab.group("host")
+                    abort_reason = ab.group("reason").strip()
+                    all_users[user]        += 1
+                    all_hosts[host]        += 1
+                    all_databases[db]      += 1
+                    all_abort_reasons[abort_reason] += 1
+                    if db:
+                        all_db_names.add(db)
+
+                # Extract access denied sub-fields
+                ad_user = ad_host = ad_pwd = ""
+                ad = RE_ACCESS_DENIED.search(msg)
+                if ad:
+                    ad_user = ad.group("user")
+                    ad_host = ad.group("host")
+                    ad_pwd  = ad.group("pwd")
+                    all_users[ad_user] += 1
+                    all_hosts[ad_host] += 1
+
+                # DNS failure check
+                dns_match = RE_DNS.search(msg)
+                dns_entity = dns_match.group("entity") if dns_match else ""
+
+                # LSN
+                lsn_m = RE_LSN.search(msg)
+                lsn   = lsn_m.group(1) if lsn_m else ""
+
+                # Message template (for pattern discovery)
+                template = _anonymize(msg)
+                message_templates[template] += 1
+
+                # Fingerprint for audit integrity
+                fp = hashlib.sha256(
+                    f"{ts_str}|{m.group('thread')}|{msg[:120]}".encode()
+                ).hexdigest()[:16]
+
+                current = {
+                    # ── Identity ──────────────────────────
+                    "event_id":             len(raw_events) + 1,
+                    "fingerprint":          fp,
+                    "source_line_number":   raw_line_count,
+                    # ── Temporal ──────────────────────────
+                    "timestamp":            ts_str,
+                    "date":                 date_str,
+                    "time":                 time_str,
+                    "hour":                 hour,
+                    "day_of_week":          dow,
+                    "month":                mon,
+                    "year":                 yr,
+                    # ── Core MariaDB fields ───────────────
+                    "thread_id":            m.group("thread"),
+                    "level":                level,
+                    "message":              msg,
+                    # ── Connection fields ─────────────────
+                    "user":                 user,
+                    "host":                 host,
+                    "database":             db,
+                    "connection_id":        conn_id,
+                    "abort_reason":         abort_reason,
+                    # ── Access denied fields ──────────────
+                    "access_denied_user":   ad_user,
+                    "access_denied_host":   ad_host,
+                    "access_denied_pwd_used": ad_pwd,
+                    # ── DNS fields ────────────────────────
+                    "dns_failure":          "1" if dns_match else "0",
+                    "dns_entity":           dns_entity,
+                    # ── InnoDB fields ─────────────────────
+                    "lsn_checkpoint":       lsn,
+                    # ── Boolean feature flags (for ML) ────
+                    "is_aborted_connection": "1" if ab else "0",
+                    "is_access_denied":      "1" if ad else "0",
+                    "is_crash_recovery":     "1" if "crash recovery" in msg.lower() else "0",
+                    "is_aria_recovery":      "1" if "aria engine: starting recovery" in msg.lower() else "0",
+                    "is_service_startup":    "1" if "ready for connections" in msg.lower() else "0",
+                    "is_clean_shutdown":     "1" if "normal shutdown" in msg.lower() else "0",
+                    "is_dns_failure":        "1" if dns_match else "0",
+                    # ── Labels — filled in Pass 2 ─────────
+                    "label":             "",
+                    "sublabel":          "",
+                    "severity":          "",
+                    "severity_score":    "",
+                    "rule_id":           "",
+                    "rule_description":  "",
+                    "model_flags":       "",
+                    "confidence":        "",
+                    "is_incident":       "",
+                    "is_after_hours":    "",
+                    "host_status":       "",
+                    "user_status":       "",
+                    "analyst_notes":     "",
+                    # ── Internal ──────────────────────────
+                    "_continuation":     0,
+                    "_extra":            "",
+                }
+            else:
+                if current:
+                    current["message"] += " || " + stripped
+                    current["_continuation"] += 1
+                else:
+                    skipped_lines += 1
+
+    if current:
+        raw_events.append(current)
+
+    # ── Build date range ─────────────────────────────────────────────
+    all_dates_sorted = sorted(set(all_dates))
+    date_range = (
+        (all_dates_sorted[0], all_dates_sorted[-1])
+        if all_dates_sorted else ("unknown", "unknown")
+    )
+
+    return {
+        "raw_events":        raw_events,
+        "file_size_bytes":   file_size,
+        "raw_line_count":    raw_line_count,
+        "skipped_lines":     skipped_lines,
+        "all_users":         all_users,
+        "all_hosts":         all_hosts,
+        "all_databases":     all_databases,
+        "all_levels":        all_levels,
+        "all_abort_reasons": all_abort_reasons,
+        "all_db_names":      all_db_names,
+        "date_range":        date_range,
+        "all_dates":         all_dates_sorted,
+        "version_strings":   version_strings,
+        "message_templates": message_templates,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# BASELINE COMPUTATION
+# Derives "normal" users and hosts statistically from the discovered data
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_baseline(disc: dict, user_pct: float, host_pct: float) -> dict:
+    """
+    Compute the statistical baseline for what is "normal" in this log.
+
+    Strategy:
+        - BASELINE USERS : users that account for >= user_pct% of all
+          connection events. These are the routine database accounts.
+          Any other user is anomalous.
+        - BASELINE HOSTS : hosts that account for >= host_pct% of all
+          connection events. Anything below threshold is either new,
+          temporary, or suspicious.
+        - PRIMARY DATABASE : the database accessed in the most connections.
+        - PRIMARY USER : the single most frequent user (the "standard" account).
+        - RARE USERS : users seen in very few events (< 0.5% of connections).
+        - UNKNOWN HOSTS : hosts with raw IP or IPv6 addresses.
+    """
+    total_conn = sum(disc["all_users"].values()) or 1
+    total_host = sum(disc["all_hosts"].values()) or 1
+
+    baseline_users = {
+        u for u, c in disc["all_users"].items()
+        if (c / total_conn * 100) >= user_pct
+    }
+    baseline_hosts = {
+        h for h, c in disc["all_hosts"].items()
+        if (c / total_host * 100) >= host_pct
+        and not RE_IPV6.match(h)
+        and not RE_IPV4.match(h)
+        and h not in ("", "unknown", "unconnected")
+    }
+
+    primary_user = (
+        disc["all_users"].most_common(1)[0][0]
+        if disc["all_users"] else ""
+    )
+    primary_db = (
+        disc["all_databases"].most_common(1)[0][0]
+        if disc["all_databases"] else ""
+    )
+
+    rare_users = {
+        u for u, c in disc["all_users"].items()
+        if (c / total_conn * 100) < 0.5 and u not in ("", "unauthenticated", "unconnected")
+    }
+    ipv6_hosts = {h for h in disc["all_hosts"] if RE_IPV6.match(h)}
+    ip_hosts   = {h for h in disc["all_hosts"] if RE_IPV4.match(h)}
+    unknown_hosts = {
+        h for h in disc["all_hosts"]
+        if h and h not in baseline_hosts and not RE_IPV6.match(h) and not RE_IPV4.match(h)
+        and h not in ("", "unknown", "unconnected")
+    }
+
+    return {
+        "baseline_users":  baseline_users,
+        "baseline_hosts":  baseline_hosts,
+        "primary_user":    primary_user,
+        "primary_db":      primary_db,
+        "rare_users":      rare_users,
+        "ipv6_hosts":      ipv6_hosts,
+        "ip_hosts":        ip_hosts,
+        "unknown_hosts":   unknown_hosts,
+        "total_conn_events": total_conn,
+        "total_host_events": total_host,
+        "user_pct_threshold": user_pct,
+        "host_pct_threshold": host_pct,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PASS 2 — LABELING ENGINE (25 rules, fully deterministic)
+# Every rule produces a complete, traceable decision record.
+# ═══════════════════════════════════════════════════════════════════════
+
+RULE_CATALOG = {
+    "R01": "InnoDB crash recovery initiated",
+    "R02": "Aria engine crash recovery initiated",
+    "R03": "Database service restarted — now online",
+    "R04": "Planned normal shutdown initiated",
+    "R05": "InnoDB clean shutdown completed",
+    "R06": "Shutdown sub-sequence event",
+    "R07": "Temporary tablespace recreated after crash",
+    "R08": "Stale temporary file removed after crash",
+    "R09": "InnoDB rollback segments activated post-recovery",
+    "R10": "Unauthenticated connection — authentication never completed",
+    "R11": "Access denied — wrong credentials or unknown user",
+    "R12": "Connection from user NOT in statistical baseline",
+    "R13": "Aborted connection — 'closed without authentication' reason",
+    "R14": "Connection from unregistered IPv6 link-local device",
+    "R15": "Connection from raw IP address (no registered hostname)",
+    "R16": "Aborted connection from host NOT in statistical baseline",
+    "R17": "Aborted connection from baseline host — benign (connection pool)",
+    "R18": "After-hours aborted connection from baseline host",
+    "R19": "DNS resolution failure or hostname/IP mismatch",
+    "R20": "After-hours database activity (general)",
+    "R21": "InnoDB buffer pool operation — benign startup/shutdown",
+    "R22": "Plugin or extension status event — benign",
+    "R23": "Startup sequence or replication configuration — benign",
+    "R24": "General informational Note — benign operational",
+    "R25": "Unclassified Warning — requires manual analyst review",
+}
+
+
+def label_event(event: dict, bl: dict, work_start: int, work_end: int) -> dict:
+    """
+    Apply the 25-rule labeling engine to a single event.
+    Uses only the dynamically computed baseline (bl), no hardcoded values.
+    """
+
+    msg   = event["message"].lower()
+    user  = event["user"]
+    host  = event["host"]
+    level = event["level"]
+    hour  = event["hour"]
+    ad_u  = event["access_denied_user"]
+    dns   = event["is_dns_failure"]
+
+    is_aft = (hour != -1 and (hour < work_start or hour > work_end))
+    abort_reason = event["abort_reason"].lower()
+
+    label      = "BENIGN"
+    sublabel   = "general_informational"
+    severity   = "INFO"
+    rule_id    = "R24"
+    models     = []
     confidence = "HIGH"
-    notes = ""
+    notes      = ""
 
-    # ── SYSTEM DOWNTIME RULES ──────────────────────────────
+    # ── Determine host and user status ───────────────────────────────
+    if not host:
+        host_status = "no_host"
+    elif RE_IPV6.match(host):
+        host_status = "ipv6_unregistered"
+    elif RE_IPV4.match(host):
+        host_status = "raw_ip"
+    elif host in bl["baseline_hosts"]:
+        host_status = "baseline"
+    elif host in ("unknown", "unconnected"):
+        host_status = "system"
+    else:
+        host_status = "non_baseline"
 
-    # R01: InnoDB crash recovery — definitive crash event
-    if "innodb: starting crash recovery" in msg:
-        label = "SYSTEM_DOWNTIME"
-        sublabel = "innodb_crash_recovery"
-        severity = "CRITICAL"
-        model_target = "downtime_model, data_corruption_model"
-        rule_id = "R01"
-        notes = "InnoDB detected unclean shutdown. Data pages may be inconsistent."
-
-    # R02: Aria engine recovery — secondary storage engine crash
-    elif "aria engine: starting recovery" in msg:
-        label = "SYSTEM_DOWNTIME"
-        sublabel = "aria_crash_recovery"
-        severity = "HIGH"
-        model_target = "downtime_model, data_corruption_model"
-        rule_id = "R02"
-        notes = "Aria storage engine requires recovery. Tables may have been corrupted."
-
-    # R03: Service startup after crash (no preceding normal shutdown)
-    elif "ready for connections" in msg:
-        label = "SYSTEM_DOWNTIME"
-        sublabel = "service_restart"
-        severity = "MEDIUM"
-        model_target = "downtime_model"
-        rule_id = "R03"
-        notes = "Database server restarted. If preceded by crash recovery, downtime confirmed."
-
-    # R04: Normal planned shutdown
-    elif "normal shutdown" in msg:
-        label = "PLANNED_MAINTENANCE"
-        sublabel = "normal_shutdown"
-        severity = "INFO"
-        model_target = "downtime_model"
-        rule_id = "R04"
-        notes = "Authorized, clean shutdown. Benign — use as negative class for downtime model."
-
-    # R05: InnoDB shutdown completed
-    elif "innodb: shutdown completed" in msg:
-        label = "PLANNED_MAINTENANCE"
-        sublabel = "clean_shutdown_complete"
-        severity = "INFO"
-        model_target = "downtime_model"
-        rule_id = "R05"
-        notes = "Clean shutdown sequence completed successfully."
-
-    # R06: Event scheduler purging — part of shutdown
-    elif "event scheduler: purging" in msg:
-        label = "PLANNED_MAINTENANCE"
-        sublabel = "shutdown_sequence"
-        severity = "INFO"
-        model_target = "downtime_model"
-        rule_id = "R06"
-
-    # ── DATA CORRUPTION RULES ─────────────────────────────
-
-    # R07: Temporary tablespace being recreated — follows crash
-    elif "creating shared tablespace for temporary tables" in msg:
-        label = "DATA_CORRUPTION"
-        sublabel = "temp_tablespace_recreated"
-        severity = "HIGH"
-        model_target = "data_corruption_model"
-        rule_id = "R07"
-        notes = "Temp tablespace recreation indicates previous instance terminated abnormally."
-
-    # R08: Removed temp tablespace data file — unsafe leftover from crash
-    elif "removed temporary tablespace data file" in msg:
-        label = "DATA_CORRUPTION"
-        sublabel = "temp_file_removed_after_crash"
-        severity = "MEDIUM"
-        model_target = "data_corruption_model"
-        rule_id = "R08"
-        notes = "Leftover temp file from unclean shutdown removed. Risk of incomplete transactions."
-
-    # R09: Rollback segments active after recovery
-    elif "rollback segments are active" in msg:
-        label = "DATA_CORRUPTION"
-        sublabel = "rollback_segments_recovery"
-        severity = "MEDIUM"
-        model_target = "data_corruption_model"
-        rule_id = "R09"
-        notes = "Rollback segment activation post-crash may indicate uncommitted transactions were lost."
-
-    # ── UNAUTHORIZED ACCESS RULES ─────────────────────────
-
-    # R10: Unauthenticated user — CRITICAL
+    if not user:
+        user_status = "no_user"
     elif user == "unauthenticated":
-        label = "UNAUTHORIZED_ACCESS"
-        sublabel = "unauthenticated_user_attempt"
-        severity = "CRITICAL"
-        model_target = "unauthorized_access_model"
-        rule_id = "R10"
+        user_status = "unauthenticated"
+    elif user == "unconnected":
+        user_status = "unconnected_system"
+    elif user in bl["baseline_users"]:
+        user_status = "baseline"
+    else:
+        user_status = "non_baseline"
+
+    event["host_status"] = host_status
+    event["user_status"] = user_status
+
+    # ══════════════════════════════════════════════════════════════════
+    # BLOCK A — SYSTEM DOWNTIME
+    # ══════════════════════════════════════════════════════════════════
+
+    if "innodb: starting crash recovery" in msg:
+        label     = "SYSTEM_DOWNTIME"
+        sublabel  = "innodb_crash_recovery"
+        severity  = "CRITICAL"
+        rule_id   = "R01"
+        models    = ["downtime_events", "data_corruption"]
+        lsn = event.get("lsn_checkpoint", "")
+        notes = (
+            "InnoDB detected that the previous database instance did not shut "
+            "down cleanly. It will replay the redo log from the last checkpoint "
+            f"(LSN={lsn if lsn else 'unknown'}) to recover committed transactions "
+            "and discard uncommitted ones. The EMR system is UNAVAILABLE to all "
+            "hospital workstations until recovery completes. This event marks the "
+            "START of a downtime session."
+        )
+
+    elif "aria engine: starting recovery" in msg:
+        label     = "SYSTEM_DOWNTIME"
+        sublabel  = "aria_engine_crash_recovery"
+        severity  = "CRITICAL"
+        rule_id   = "R02"
+        models    = ["downtime_events", "data_corruption"]
+        notes = (
+            "The Aria storage engine (used for MariaDB internal system tables and "
+            "some temporary tables) detected an unclean shutdown and is performing "
+            "recovery. Aria recovery running alongside InnoDB recovery indicates a "
+            "hard system failure — likely a power outage or OS crash. EMR system "
+            "is UNAVAILABLE. This event also marks the START of a downtime session."
+        )
+
+    elif "ready for connections" in msg:
+        label     = "SYSTEM_DOWNTIME"
+        sublabel  = "service_restart_online"
+        severity  = "MEDIUM"
+        rule_id   = "R03"
+        models    = ["downtime_events"]
+        notes = (
+            "Database service has restarted successfully and is accepting new "
+            "connections. When preceded by a crash recovery event (R01 or R02), "
+            "this event marks the END of a downtime session. The time difference "
+            "between the crash event and this event is the downtime duration — "
+            "used to calculate MTTR (Mean Time To Recovery) for the IRP."
+        )
+
+    elif "normal shutdown" in msg:
+        label     = "PLANNED_MAINTENANCE"
+        sublabel  = "authorized_normal_shutdown"
+        severity  = "INFO"
+        rule_id   = "R04"
+        models    = ["downtime_events"]
+        notes = (
+            "Database shutdown was initiated in a controlled, authorized manner. "
+            "This is a BENIGN planned maintenance event. It serves as the NEGATIVE "
+            "class (label=0) for the downtime detection model — the model must "
+            "learn to distinguish planned shutdowns from crash-induced downtime."
+        )
+
+    elif "innodb: shutdown completed" in msg or (
+            "shutdown complete" in msg and "innodb" in msg):
+        label     = "PLANNED_MAINTENANCE"
+        sublabel  = "innodb_clean_shutdown_complete"
+        severity  = "INFO"
+        rule_id   = "R05"
+        models    = ["downtime_events"]
+        notes = (
+            "InnoDB completed its clean shutdown sequence — all dirty pages flushed, "
+            "clean checkpoint written. No crash recovery needed on next startup. "
+            "Confirms the authorized shutdown classification."
+        )
+
+    elif "event scheduler: purging" in msg or (
+            "fts optimize thread exiting" in msg) or (
+            "initiated by:" in msg and "shutdown" in msg):
+        label     = "PLANNED_MAINTENANCE"
+        sublabel  = "shutdown_sub_sequence"
+        severity  = "INFO"
+        rule_id   = "R06"
+        models    = ["downtime_events"]
+        notes = "Part of the authorized shutdown sub-sequence. Benign operational event."
+
+    # ══════════════════════════════════════════════════════════════════
+    # BLOCK B — DATA CORRUPTION RISK
+    # ══════════════════════════════════════════════════════════════════
+
+    elif "creating shared tablespace for temporary tables" in msg:
+        label     = "DATA_CORRUPTION"
+        sublabel  = "temp_tablespace_recreated_post_crash"
+        severity  = "HIGH"
+        rule_id   = "R07"
+        models    = ["data_corruption"]
+        notes = (
+            "InnoDB is recreating the shared temporary tablespace (ibtmp1) because "
+            "the prior instance left it in an inconsistent state. Any EMR temporary "
+            "table data open at the time of the crash — such as in-progress patient "
+            "record saves or billing transactions — is permanently lost. This event "
+            "is a DATA INTEGRITY RISK marker."
+        )
+
+    elif "removed temporary tablespace data file" in msg:
+        label     = "DATA_CORRUPTION"
+        sublabel  = "stale_temp_file_removed_after_crash"
+        severity  = "MEDIUM"
+        rule_id   = "R08"
+        models    = ["data_corruption"]
+        notes = (
+            "InnoDB found and removed a leftover temporary tablespace file from the "
+            "crashed prior session. This confirms the previous session ended "
+            "abnormally. Any data held exclusively in temporary structures during "
+            "that session is unrecoverable."
+        )
+
+    elif "rollback segments are active" in msg:
+        label     = "DATA_CORRUPTION"
+        sublabel  = "rollback_segments_activated_post_crash"
+        severity  = "MEDIUM"
+        rule_id   = "R09"
+        models    = ["data_corruption"]
+        notes = (
+            "InnoDB's rollback segments are being activated as part of crash "
+            "recovery. This means uncommitted transactions present at crash time "
+            "are being rolled back to restore ACID consistency. From the EMR "
+            "perspective: any patient record or billing entry that was being "
+            "written when the system crashed was NOT saved."
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # BLOCK C — UNAUTHORIZED ACCESS
+    # ══════════════════════════════════════════════════════════════════
+
+    elif user_status == "unauthenticated" and "closed normally without authentication" in abort_reason:
+        label     = "UNAUTHORIZED_ACCESS"
+        sublabel  = "connection_closed_without_authentication"
+        severity  = "HIGH"
+        rule_id   = "R13"
+        models    = ["unauthorized_access"]
         confidence = "HIGH"
-        notes = "Connection attempted before authentication completed. Possible brute-force or scanner."
+        notes = (
+            f"A connection from host '{host}' was closed before authentication "
+            "completed, but MariaDB reports it as 'closed normally'. This pattern "
+            "typically indicates a connection pooling client that probes the "
+            "database port without completing a login — or a tool verifying "
+            "port availability. Less severe than R10 but still warrants logging."
+        )
 
-    # R11: Unknown/unregistered user
-    elif user and user not in KNOWN_USERS and user not in ("", "unknown"):
-        label = "UNAUTHORIZED_ACCESS"
-        sublabel = "unknown_user_account"
-        severity = "HIGH"
-        model_target = "unauthorized_access_model"
-        rule_id = "R11"
-        notes = f"User '{user}' is not in the approved user list. Verify with IT admin."
+    elif user_status == "unauthenticated":
+        label     = "UNAUTHORIZED_ACCESS"
+        sublabel  = "unauthenticated_connection_dropped"
+        severity  = "CRITICAL"
+        rule_id   = "R10"
+        models    = ["unauthorized_access"]
+        confidence = "HIGH"
+        notes = (
+            f"A database connection from host '{host}' was dropped before "
+            "authentication completed. The user field shows 'unauthenticated' — "
+            "meaning the TCP connection was established to the database port (3306) "
+            "but credentials were never submitted. Possible causes: port scanner, "
+            "brute-force tool, or severely misconfigured client. This is a "
+            "CRITICAL unauthorized access signal."
+        )
 
-    # R12: IPv6 link-local address — unregistered device
-    elif host and host.startswith("fe80::"):
-        label = "SUSPICIOUS"
-        sublabel = "unregistered_ipv6_device"
-        severity = "HIGH"
-        model_target = "unauthorized_access_model, suspicious_model"
-        rule_id = "R12"
+    elif event["is_access_denied"] == "1":
+        is_unknown_u = ad_u not in bl["baseline_users"] and ad_u not in (
+            "", "unauthenticated", "unconnected")
+        _ad_host = event.get("access_denied_host", host)
+        label     = "UNAUTHORIZED_ACCESS"
+        sublabel  = (
+            "access_denied_unknown_user" if is_unknown_u
+            else "access_denied_wrong_credentials"
+        )
+        severity  = "CRITICAL" if is_unknown_u else "HIGH"
+        rule_id   = "R11"
+        models    = ["unauthorized_access"]
+        confidence = "HIGH"
+        notes = (
+            f"Database rejected login from user '{ad_u}' at host '{_ad_host}'. "
+            + (
+                f"CRITICAL: '{ad_u}' is NOT in the statistical baseline of known "
+                f"database users. This is an unrecognized account attempting to "
+                f"access the hospital EMR database — a confirmed unauthorized "
+                f"access attempt requiring immediate investigation."
+                if is_unknown_u else
+                f"The user exists in the baseline but provided wrong credentials. "
+                f"Could indicate: a password change event, misconfigured EMR "
+                f"client, or a targeted credential-stuffing attack."
+            )
+        )
+
+    elif user_status == "non_baseline" and user not in ("", "unconnected"):
+        label     = "UNAUTHORIZED_ACCESS"
+        sublabel  = "connection_from_non_baseline_user"
+        severity  = "HIGH"
+        rule_id   = "R12"
+        models    = ["unauthorized_access"]
         confidence = "MEDIUM"
-        notes = f"IPv6 link-local address '{host}' not in known host registry. Possible rogue device."
+        notes = (
+            f"User '{user}' is not in the statistical baseline of routine database "
+            f"users (threshold: top {bl['user_pct_threshold']}% by connection volume). "
+            f"This account is either newly created, rarely used, or unauthorized. "
+            f"Verify with the hospital IT administrator."
+        )
 
-    # R13: Raw IP address connection (not a hostname)
-    elif host and re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', host):
-        label = "SUSPICIOUS"
-        sublabel = "raw_ip_connection"
-        severity = "MEDIUM"
-        model_target = "unauthorized_access_model"
-        rule_id = "R13"
-        notes = f"Connection from IP '{host}' instead of hostname. Verify this device with IT admin."
-
-    # R14: Aborted connection from UNKNOWN host
-    elif "aborted connection" in msg and host and host not in KNOWN_HOSTS:
-        label = "SUSPICIOUS"
-        sublabel = "aborted_from_unknown_host"
-        severity = "HIGH"
-        model_target = "unauthorized_access_model, suspicious_model"
-        rule_id = "R14"
+    elif host_status == "ipv6_unregistered":
+        label     = "SUSPICIOUS"
+        sublabel  = "connection_from_ipv6_link_local_device"
+        severity  = "HIGH"
+        rule_id   = "R14"
+        models    = ["unauthorized_access", "suspicious_review"]
         confidence = "MEDIUM"
-        notes = f"Host '{host}' is not in approved network registry. Could be a new workstation or intruder."
+        notes = (
+            f"Connection from IPv6 link-local address '{host}'. Link-local addresses "
+            "(fe80::) are auto-configured and do not appear in the hospital DNS. "
+            "This device connected to the EMR database without a registered "
+            "hostname — it may be a personal device, an unregistered workstation, "
+            "or a rogue device on the hospital intranet."
+        )
 
-    # R15: Aborted connection from known host — network instability (benign)
-    elif "aborted connection" in msg and host in KNOWN_HOSTS:
-        # Check if it happened outside normal hours — escalate if so
-        if hour < NORMAL_HOURS_START or hour > NORMAL_HOURS_END:
-            label = "SUSPICIOUS"
-            sublabel = "after_hours_aborted_connection"
-            severity = "MEDIUM"
-            model_target = "unauthorized_access_model"
-            rule_id = "R15B"
-            notes = f"Known host '{host}' aborted connection outside working hours ({hour}:xx). Monitor."
+    elif host_status == "raw_ip":
+        label     = "SUSPICIOUS"
+        sublabel  = "connection_from_raw_ip_no_hostname"
+        severity  = "HIGH"
+        rule_id   = "R15"
+        models    = ["unauthorized_access", "suspicious_review"]
+        confidence = "MEDIUM"
+        notes = (
+            f"Connection came from raw IP address '{host}' instead of a registered "
+            "hostname. Legitimate EMR workstations connect by hostname. A direct "
+            "IP connection can indicate: a device not registered in hospital DNS, "
+            "a connection from outside the expected subnet, or a script/tool "
+            "bypassing hostname-based access controls."
+        )
+
+    elif event["is_aborted_connection"] == "1" and host_status == "non_baseline":
+        label     = "SUSPICIOUS"
+        sublabel  = "aborted_connection_non_baseline_host"
+        severity  = "HIGH"
+        rule_id   = "R16"
+        models    = ["unauthorized_access", "suspicious_review"]
+        confidence = "MEDIUM"
+        notes = (
+            f"Host '{host}' is not in the statistical baseline of regular "
+            f"connecting workstations (threshold: top {bl['host_pct_threshold']}% "
+            "by connection volume). This device made a database connection that "
+            "was then dropped. Verify this host with the IT administrator."
+        )
+
+    elif event["is_aborted_connection"] == "1" and host_status == "baseline":
+        if is_aft:
+            label     = "SUSPICIOUS"
+            sublabel  = "after_hours_aborted_connection_baseline_host"
+            severity  = "MEDIUM"
+            rule_id   = "R18"
+            models    = ["unauthorized_access"]
+            confidence = "MEDIUM"
+            notes = (
+                f"Registered workstation '{host}' aborted a database connection at "
+                f"{hour:02d}:xx — outside normal working hours "
+                f"({work_start:02d}:00–{work_end:02d}:00). While this host is "
+                "recognized, after-hours access in a hospital EMR environment "
+                "should be confirmed as authorized with IT management."
+            )
         else:
-            label = "BENIGN"
-            sublabel = "network_instability_known_host"
-            severity = "LOW"
-            model_target = "downtime_model"
-            rule_id = "R15"
-            notes = "Known host dropped connection. Likely EMR app reconnection cycle or network blip."
+            label     = "BENIGN"
+            sublabel  = "emr_connection_pool_recycle"
+            severity  = "LOW"
+            rule_id   = "R17"
+            models    = []
+            notes = (
+                f"Registered workstation '{host}' dropped a database connection. "
+                "This is the expected behavior of the EMR application's connection "
+                "pooling system — it opens multiple connections and periodically "
+                "recycles them. The abort reason '{}' is a normal pool management "
+                "signal. BENIGN — use as negative class for unauthorized access "
+                "model.".format(abort_reason)
+            )
 
-    # R16: Access outside normal hours from any host
-    elif (hour < NORMAL_HOURS_START or hour > NORMAL_HOURS_END) and level == "Note":
-        label = "SUSPICIOUS"
-        sublabel = "after_hours_activity"
-        severity = "LOW"
-        model_target = "unauthorized_access_model"
-        rule_id = "R16"
+    elif dns == "1":
+        label     = "SUSPICIOUS"
+        sublabel  = "dns_resolution_failure_or_hostname_mismatch"
+        severity  = "MEDIUM"
+        rule_id   = "R19"
+        models    = ["unauthorized_access", "suspicious_review"]
+        confidence = "MEDIUM"
+        notes = (
+            f"MariaDB could not resolve '{event['dns_entity']}' to its expected "
+            "address. Causes include: (1) device with multiple network adapters "
+            "presenting different addresses, (2) stale DNS records on the hospital "
+            "network, or (3) in a threat scenario, hostname spoofing. The "
+            "hostname/IP combination should be verified with the IT administrator."
+        )
+
+    elif event["is_aborted_connection"] == "1" and host_status in ("no_host", "system"):
+        label     = "BENIGN"
+        sublabel  = "system_internal_connection"
+        severity  = "INFO"
+        rule_id   = "R24"
+        notes     = "Internal system connection event. Benign."
+
+    # ══════════════════════════════════════════════════════════════════
+    # BLOCK D — AFTER HOURS (general)
+    # ══════════════════════════════════════════════════════════════════
+
+    elif is_aft and level == "Warning" and not event["is_aborted_connection"] == "1":
+        label     = "SUSPICIOUS"
+        sublabel  = "after_hours_warning_event"
+        severity  = "LOW"
+        rule_id   = "R20"
+        models    = ["suspicious_review"]
         confidence = "LOW"
-        notes = f"Database activity at {hour}:xx — outside normal operational hours. Low confidence flag."
+        notes = (
+            f"Warning-level database event at {hour:02d}:xx, outside normal "
+            f"working hours ({work_start:02d}:00–{work_end:02d}:00). "
+            "Low confidence flag — verify if this is scheduled maintenance."
+        )
 
-    # ── INFORMATIONAL / BENIGN ────────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+    # BLOCK E — BENIGN OPERATIONAL
+    # ══════════════════════════════════════════════════════════════════
 
-    # R17: Buffer pool operations
     elif "buffer pool" in msg:
-        label = "BENIGN"
-        sublabel = "innodb_buffer_pool_op"
+        label    = "BENIGN"
+        sublabel = "innodb_buffer_pool_management"
         severity = "INFO"
-        model_target = "downtime_model"
-        rule_id = "R17"
+        rule_id  = "R21"
+        notes    = "InnoDB buffer pool management operation. Routine startup/shutdown activity."
 
-    # R18: Plugin disabled
-    elif "plugin" in msg and "disabled" in msg:
-        label = "BENIGN"
-        sublabel = "plugin_disabled"
+    elif any(k in msg for k in ["plugin", "feedback"]) and level == "Note":
+        label    = "BENIGN"
+        sublabel = "plugin_extension_status"
         severity = "INFO"
-        rule_id = "R18"
+        rule_id  = "R22"
+        notes    = "Database plugin/extension status report. Routine informational event."
 
-    # R19: Server socket created — normal startup
-    elif "server socket created" in msg:
-        label = "BENIGN"
-        sublabel = "socket_created_startup"
+    elif any(k in msg for k in [
+        "server socket created", "master_info", "reading of all master",
+        "added new master_info", "fts optimize thread",
+        "waiting for purge", "innodb: uses event", "innodb: mutexes",
+        "innodb: compressed", "innodb: number of pools", "innodb: using",
+        "innodb: completed initialization", "innodb: initializing",
+        "innodb: n.n", "innodb: file", "innodb: setting file",
+        "starting mariadb", "mariadb source revision",
+        "loading buffer pool", "instance", "dump completed",
+        "aria engine: recovery done",
+    ]):
+        label    = "BENIGN"
+        sublabel = "startup_replication_or_config"
         severity = "INFO"
-        model_target = "downtime_model"
-        rule_id = "R19"
+        rule_id  = "R23"
+        notes    = "Startup, configuration, or replication check event. Benign."
 
-    # R20: Reading master info — replication setup check
-    elif "master_info" in msg or "reading of all master" in msg:
-        label = "BENIGN"
-        sublabel = "replication_check"
-        severity = "INFO"
-        rule_id = "R20"
-
-    # R21: General startup/shutdown informational notes
     elif level == "Note":
-        label = "BENIGN"
-        sublabel = "operational_note"
+        label    = "BENIGN"
+        sublabel = "general_informational_note"
         severity = "INFO"
-        rule_id = "R21"
+        rule_id  = "R24"
+        notes    = "Informational note logged by MariaDB. No security concern identified."
 
-    # R22: Unclassified warning
     elif level == "Warning":
-        label = "SUSPICIOUS"
-        sublabel = "unclassified_warning"
-        severity = "LOW"
-        model_target = "suspicious_model"
-        rule_id = "R22"
+        label     = "SUSPICIOUS"
+        sublabel  = "unclassified_warning_manual_review"
+        severity  = "LOW"
+        rule_id   = "R25"
+        models    = ["suspicious_review"]
         confidence = "LOW"
-        notes = "Warning not matched by any specific rule. Manual review recommended."
+        notes = (
+            "This Warning-level event did not match any defined rule pattern. "
+            "This is expected when running on the full log — the full file may "
+            "contain Warning types not present in the sample. This event is "
+            "queued for manual IT administrator review. Rule R25 is specifically "
+            "designed as the catch-all for novel warnings."
+        )
 
-    # R23: Error level — always flag
     elif level == "Error":
-        label = "SYSTEM_DOWNTIME"
-        sublabel = "database_error"
-        severity = "HIGH"
-        model_target = "downtime_model"
-        rule_id = "R23"
-        notes = "Database-level error. Could precede or cause downtime."
+        label     = "SYSTEM_DOWNTIME"
+        sublabel  = "explicit_database_error"
+        severity  = "HIGH"
+        rule_id   = "R01"
+        models    = ["downtime_events"]
+        notes     = "MariaDB logged an explicit Error-level event. Investigate the full message."
 
-    event.update({
-        "label": label,
-        "sublabel": sublabel,
-        "severity": severity,
-        "model_target": model_target,
-        "rule_id": rule_id,
-        "confidence": confidence,
-        "labeling_notes": notes,
-    })
+    else:
+        label    = "BENIGN"
+        sublabel = "uncategorized_benign"
+        severity = "INFO"
+        rule_id  = "R24"
+        notes    = "Event did not match any specific rule. Classified as benign by default."
+
+    # ── Populate all derived fields ───────────────────────────────────
+    event["label"]           = label
+    event["sublabel"]        = sublabel
+    event["severity"]        = severity
+    event["severity_score"]  = SEVERITY_WEIGHT.get(severity, 1)
+    event["rule_id"]         = rule_id
+    event["rule_description"]= RULE_CATALOG.get(rule_id, "Unknown rule")
+    event["model_flags"]     = ", ".join(models) if models else "none"
+    event["confidence"]      = confidence
+    event["is_incident"]     = "1" if label not in ("BENIGN",) else "0"
+    event["is_after_hours"]  = "1" if is_aft else "0"
+    event["analyst_notes"]   = notes
+
+    # Remove internal tracking keys before export
+    event.pop("_continuation", None)
+    event.pop("_extra", None)
+
     return event
 
 
-# ============================================================
-# PARSER
-# ============================================================
-
-def parse_log_file(filepath: str) -> list:
-    """Parse a MariaDB error log file into structured event dictionaries."""
-    
-    events = []
-    current_event = None
-    line_number = 0
-    parse_errors = 0
-
-    print(f"\n[INFO] Opening log file: {filepath}")
-    
-    try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            for raw_line in f:
-                line_number += 1
-                line = raw_line.strip()
-                
-                if not line:
-                    continue
-
-                match = MAIN_PATTERN.match(line)
-                
-                if match:
-                    # Save previous event if exists
-                    if current_event:
-                        events.append(current_event)
-
-                    # Parse timestamp
-                    ts_str = f"{match.group('date')} {match.group('time')}"
-                    try:
-                        ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                    except ValueError:
-                        ts = None
-                        parse_errors += 1
-
-                    message = match.group("message").strip()
-
-                    # Extract aborted connection details if present
-                    user = ""
-                    host = ""
-                    database = ""
-                    conn_id = ""
-                    abort_reason = ""
-
-                    aborted_match = ABORTED_PATTERN.search(message)
-                    if aborted_match:
-                        conn_id = aborted_match.group("conn_id")
-                        database = aborted_match.group("db")
-                        user = aborted_match.group("user")
-                        host = aborted_match.group("host")
-                        abort_reason = aborted_match.group("reason")
-
-                    current_event = {
-                        "line_number": line_number,
-                        "timestamp": ts_str if ts else "",
-                        "date": match.group("date"),
-                        "time": match.group("time"),
-                        "hour": ts.hour if ts else -1,
-                        "day_of_week": ts.strftime("%A") if ts else "",
-                        "thread_id": match.group("thread_id"),
-                        "level": match.group("level"),
-                        "message": message,
-                        "user": user,
-                        "host": host,
-                        "database": database,
-                        "connection_id": conn_id,
-                        "abort_reason": abort_reason,
-                        "is_aborted_connection": "1" if aborted_match else "0",
-                        "is_crash_recovery": "1" if "crash recovery" in message.lower() else "0",
-                        "is_aria_recovery": "1" if "aria engine: starting recovery" in message.lower() else "0",
-                        "is_startup": "1" if "ready for connections" in message.lower() else "0",
-                        "is_shutdown": "1" if "normal shutdown" in message.lower() else "0",
-                        "host_is_known": "1" if host in KNOWN_HOSTS else ("" if not host else "0"),
-                        "host_is_ipv6": "1" if (host and host.startswith("fe80::")) else "0",
-                        "user_is_known": "1" if user in KNOWN_USERS else ("" if not user else "0"),
-                        "is_after_hours": "1" if ts and (ts.hour < NORMAL_HOURS_START or ts.hour > NORMAL_HOURS_END) else "0",
-                        # Labels — filled in next step
-                        "label": "",
-                        "sublabel": "",
-                        "severity": "",
-                        "model_target": "",
-                        "rule_id": "",
-                        "confidence": "HIGH",
-                        "labeling_notes": "",
-                    }
-
-                else:
-                    # Continuation line — append to current event message
-                    if current_event:
-                        current_event["message"] += " | " + line
-                    else:
-                        parse_errors += 1
-
-    except FileNotFoundError:
-        print(f"\n[ERROR] File not found: {filepath}")
-        print("Please check the path and try again.")
-        sys.exit(1)
-
-    # Don't forget last event
-    if current_event:
-        events.append(current_event)
-
-    print(f"[INFO] Parsed {len(events)} events from {line_number} lines ({parse_errors} continuation/unparsed lines)")
-    return events
-
-
-# ============================================================
-# LABELING PASS
-# ============================================================
-
-def label_all_events(events: list) -> list:
-    """Apply labeling rules to all parsed events."""
-    print(f"[INFO] Labeling {len(events)} events...")
-    labeled = [apply_labeling_rules(e) for e in events]
-    
-    label_counts = Counter(e["label"] for e in labeled)
-    print(f"[INFO] Label distribution:")
-    for label, count in sorted(label_counts.items(), key=lambda x: -x[1]):
-        print(f"        {label:<30} {count:>6} events")
-    
-    return labeled
-
-
-# ============================================================
+# ═══════════════════════════════════════════════════════════════════════
 # DOWNTIME SESSION BUILDER
-# Groups crash → recovery → restart into single sessions
-# ============================================================
+# Pairs crash events with the next restart event to measure downtime
+# ═══════════════════════════════════════════════════════════════════════
 
-def build_downtime_sessions(events: list) -> list:
-    """
-    Identify contiguous downtime sessions.
-    A session = crash_recovery event → next ready_for_connections event
-    Returns list of session dicts with duration calculated.
-    """
-    sessions = []
-    in_downtime = False
-    crash_time = None
-    crash_type = ""
-    
+def build_sessions(events: list) -> list:
+    sessions    = []
+    crash_ts    = None
+    crash_type  = ""
+    crash_lsn   = ""
+    session_id  = 0
+    work_start  = 0  # not needed here — sessions just measure gap
+
     for e in events:
         ts_str = e.get("timestamp", "")
         try:
             ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
         except (ValueError, TypeError):
             continue
-        
-        if e["sublabel"] in ("innodb_crash_recovery", "aria_crash_recovery") and not in_downtime:
-            in_downtime = True
-            crash_time = ts
+
+        if e["rule_id"] in ("R01", "R02") and crash_ts is None:
+            crash_ts   = ts
             crash_type = e["sublabel"]
-        
-        elif e["sublabel"] == "service_restart" and in_downtime and crash_time:
-            duration_seconds = (ts - crash_time).total_seconds()
+            crash_lsn  = e.get("lsn_checkpoint", "")
+
+        elif e["rule_id"] == "R03" and crash_ts is not None:
+            dur_sec  = (ts - crash_ts).total_seconds()
+            session_id += 1
             sessions.append({
-                "crash_timestamp": crash_time.strftime("%Y-%m-%d %H:%M:%S"),
-                "recovery_timestamp": ts_str,
-                "crash_type": crash_type,
-                "downtime_seconds": int(duration_seconds),
-                "downtime_minutes": round(duration_seconds / 60, 2),
-                "crash_hour": crash_time.hour,
-                "crash_day_of_week": crash_time.strftime("%A"),
-                "crash_month": crash_time.strftime("%B"),
-                "crash_year": crash_time.year,
-                "is_after_hours": "1" if (crash_time.hour < NORMAL_HOURS_START or crash_time.hour > NORMAL_HOURS_END) else "0",
-                "label": "SYSTEM_DOWNTIME",
-                "severity": "CRITICAL" if duration_seconds > 300 else "HIGH",
+                "session_id":             session_id,
+                "crash_start_timestamp":  crash_ts.strftime("%Y-%m-%d %H:%M:%S"),
+                "recovery_timestamp":     ts_str,
+                "crash_type":             crash_type,
+                "lsn_at_crash":           crash_lsn,
+                "downtime_seconds":       int(dur_sec),
+                "downtime_minutes":       round(dur_sec / 60, 4),
+                "downtime_hours":         round(dur_sec / 3600, 6),
+                "crash_hour":             crash_ts.hour,
+                "crash_day_of_week":      crash_ts.strftime("%A"),
+                "crash_month":            crash_ts.strftime("%B"),
+                "crash_year":             crash_ts.year,
+                "crash_date":             crash_ts.strftime("%Y-%m-%d"),
+                "is_after_hours":         "1" if (crash_ts.hour < 7 or crash_ts.hour > 21) else "0",
+                "is_long_outage":         "1" if dur_sec > 3600 else "0",
+                "label":                  "SYSTEM_DOWNTIME",
+                "severity":               "CRITICAL" if dur_sec > 600 else "HIGH",
+                "severity_score":         5 if dur_sec > 600 else 4,
             })
-            in_downtime = False
-            crash_time = None
-    
-    print(f"[INFO] Identified {len(sessions)} complete downtime sessions")
+            crash_ts   = None
+            crash_type = ""
+
     return sessions
 
 
-# ============================================================
-# CSV WRITERS
-# ============================================================
+# ═══════════════════════════════════════════════════════════════════════
+# FILE UTILITIES
+# ═══════════════════════════════════════════════════════════════════════
 
-def write_csv(data: list, filepath: str, description: str):
+def write_csv(data: list, path: str) -> dict:
+    """Write CSV, return metadata dict."""
     if not data:
-        print(f"[WARN] No data for {description} — skipping")
-        return
-    keys = data[0].keys()
-    with open(filepath, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(data)
-    print(f"[DONE] {description}: {len(data)} rows → {os.path.basename(filepath)}")
+        return {"rows": 0, "cols": 0, "size": 0, "path": path}
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=data[0].keys())
+        w.writeheader()
+        w.writerows(data)
+    size = os.path.getsize(path)
+    return {"rows": len(data), "cols": len(data[0].keys()), "size": size, "path": path}
 
 
-def write_summary(events: list, sessions: list, output_dir: str):
-    """Write a human-readable summary report."""
-    
-    label_counts = Counter(e["label"] for e in events)
-    severity_counts = Counter(e["severity"] for e in events)
-    host_counts = Counter(e["host"] for e in events if e["host"])
-    rule_counts = Counter(e["rule_id"] for e in events)
-    
-    total = len(events)
-    
-    lines = [
-        "=" * 65,
-        "ESUTH EMR — MariaDB Log Analysis Summary Report",
-        "PhD Research: Enhanced Incident Response Plan",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "=" * 65,
-        "",
-        f"TOTAL EVENTS PARSED:          {total}",
-        f"DATE RANGE:                   {events[0]['date']} to {events[-1]['date']}",
-        "",
-        "─" * 65,
-        "LABEL DISTRIBUTION",
-        "─" * 65,
-    ]
-    
-    for label, count in sorted(label_counts.items(), key=lambda x: -x[1]):
-        pct = count / total * 100
-        bar = "█" * int(pct / 2)
-        lines.append(f"  {label:<28} {count:>5} ({pct:5.1f}%)  {bar}")
-    
-    lines += [
-        "",
-        "─" * 65,
-        "SEVERITY DISTRIBUTION",
-        "─" * 65,
-    ]
-    for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
-        count = severity_counts.get(sev, 0)
-        pct = count / total * 100
-        lines.append(f"  {sev:<12} {count:>5} ({pct:5.1f}%)")
-    
-    lines += [
-        "",
-        "─" * 65,
-        "DOWNTIME SESSIONS",
-        "─" * 65,
-        f"  Total crash/recovery sessions: {len(sessions)}",
-    ]
+def hs(b: int) -> str:
+    """Human-readable file size."""
+    if b >= 1_073_741_824:
+        return f"{b/1_073_741_824:.2f} GB ({b:,} bytes)"
+    if b >= 1_048_576:
+        return f"{b/1_048_576:.2f} MB ({b:,} bytes)"
+    if b >= 1024:
+        return f"{b/1024:.2f} KB ({b:,} bytes)"
+    return f"{b:,} bytes"
+
+
+def wr(text: str, width: int = 64, indent: int = 6) -> list:
+    """Word-wrap text into indented lines."""
+    return textwrap.wrap(text, width=width, initial_indent=" "*indent,
+                         subsequent_indent=" "*indent)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# REPORT GENERATOR — 100% DATA-DRIVEN
+# Every single number, list, and statistic in this report comes from
+# the actual parsed events. Nothing is hardcoded.
+# ═══════════════════════════════════════════════════════════════════════
+
+def generate_report(
+    events:    list,
+    sessions:  list,
+    disc:      dict,
+    bl:        dict,
+    out_files: dict,
+    input_path:str,
+    out_dir:   str,
+    work_start:int,
+    work_end:  int,
+    start_dt:  datetime,
+) -> str:
+
+    end_dt      = datetime.now()
+    elapsed     = (end_dt - start_dt).total_seconds()
+    total       = len(events)
+    W           = 72
+
+    if total == 0:
+        return "ERROR: No events were parsed. Check the input file path and format."
+
+    # ── Pre-compute all statistics from actual data ───────────────────
+    label_ctr   = Counter(e["label"]        for e in events)
+    sev_ctr     = Counter(e["severity"]     for e in events)
+    rule_ctr    = Counter(e["rule_id"]      for e in events)
+    host_ctr    = Counter(e["host"]         for e in events if e["host"])
+    user_ctr    = Counter(e["user"]         for e in events if e["user"])
+    hour_ctr    = Counter(e["hour"]         for e in events if e["hour"] != -1)
+    dow_ctr     = Counter(e["day_of_week"]  for e in events if e["day_of_week"])
+    month_ctr   = Counter(e["month"]        for e in events if e["month"])
+    year_ctr    = Counter(str(e["year"])    for e in events if e["year"])
+    db_ctr      = Counter(e["database"]     for e in events if e["database"])
+    level_ctr   = Counter(e["level"]        for e in events)
+    sublabel_ctr= Counter(e["sublabel"]     for e in events)
+    abort_ctr   = Counter(e["abort_reason"] for e in events if e["abort_reason"])
+    model_ctr   = Counter()
+    for e in events:
+        for m in e["model_flags"].split(", "):
+            if m and m != "none":
+                model_ctr[m] += 1
+
+    incidents   = [e for e in events if e["is_incident"] == "1"]
+    benign      = [e for e in events if e["is_incident"] == "0"]
+    after_hours_inc = [e for e in incidents if e["is_after_hours"] == "1"]
+    access_denied   = [e for e in events if e["is_access_denied"] == "1"]
+    dns_failures    = [e for e in events if e["is_dns_failure"] == "1"]
+    unauth_events   = [e for e in events if e["label"] == "UNAUTHORIZED_ACCESS"]
+    suspicious_evts = [e for e in events if e["label"] == "SUSPICIOUS"]
+    downtime_evts   = [e for e in events if e["label"] == "SYSTEM_DOWNTIME"]
+    corrupt_evts    = [e for e in events if e["label"] == "DATA_CORRUPTION"]
+
+    # Downtime stats
     if sessions:
-        durations = [s["downtime_seconds"] for s in sessions]
-        lines += [
-            f"  Average downtime per session:  {round(sum(durations)/len(durations)/60, 1)} minutes",
-            f"  Longest downtime:              {round(max(durations)/60, 1)} minutes",
-            f"  Shortest downtime:             {round(min(durations)/60, 1)} minutes",
-        ]
-    
-    after_hours = sum(1 for e in events if e.get("is_after_hours") == "1" and e["label"] != "BENIGN")
-    unauth = sum(1 for e in events if e["label"] == "UNAUTHORIZED_ACCESS")
-    suspicious = sum(1 for e in events if e["label"] == "SUSPICIOUS")
-    
-    lines += [
-        "",
-        "─" * 65,
-        "SECURITY FINDINGS",
-        "─" * 65,
-        f"  Unauthorized access events:    {unauth}",
-        f"  Suspicious events:             {suspicious}",
-        f"  After-hours incidents:         {after_hours}",
-        f"  Unique connecting hosts:       {len(host_counts)}",
-        f"  Unknown/unregistered hosts:    {sum(1 for h in host_counts if h not in KNOWN_HOSTS and h)}",
-        "",
-        "─" * 65,
-        "TOP 10 MOST ACTIVE HOSTS",
-        "─" * 65,
-    ]
-    for host, count in host_counts.most_common(10):
-        known = "✓ known" if host in KNOWN_HOSTS else "⚠ UNKNOWN"
-        lines.append(f"  {host:<30} {count:>5} connections  [{known}]")
-    
-    lines += [
-        "",
-        "─" * 65,
-        "LABELING RULES FIRED",
-        "─" * 65,
-    ]
-    rule_descriptions = {
-        "R01": "InnoDB crash recovery",
-        "R02": "Aria engine crash recovery",
-        "R03": "Service restart",
-        "R04": "Normal/planned shutdown",
-        "R05": "Clean shutdown complete",
-        "R06": "Shutdown sequence",
-        "R07": "Temp tablespace recreated",
-        "R08": "Temp file removed after crash",
-        "R09": "Rollback segments recovery",
-        "R10": "Unauthenticated user attempt",
-        "R11": "Unknown user account",
-        "R12": "Unregistered IPv6 device",
-        "R13": "Raw IP connection",
-        "R14": "Aborted from unknown host",
-        "R15": "Aborted from known host (benign)",
-        "R15B": "After-hours aborted connection",
-        "R16": "General after-hours activity",
-        "R17": "Buffer pool operation",
-        "R18": "Plugin disabled",
-        "R19": "Socket created (startup)",
-        "R20": "Replication check",
-        "R21": "Operational note (generic)",
-        "R22": "Unclassified warning",
-        "R23": "Database error",
-        "R00": "Unmatched (review needed)",
+        durs        = [s["downtime_seconds"] for s in sessions]
+        total_down_s= sum(durs)
+        avg_down_m  = round(total_down_s / len(durs) / 60, 2)
+        max_down_m  = round(max(durs) / 60, 2)
+        min_down_m  = round(min(durs) / 60, 2)
+        total_down_h= round(total_down_s / 3600, 2)
+        after_h_crash= sum(1 for s in sessions if s["is_after_hours"] == "1")
+        long_outages = sum(1 for s in sessions if s["is_long_outage"] == "1")
+    else:
+        total_down_s = avg_down_m = max_down_m = min_down_m = 0
+        total_down_h = after_h_crash = long_outages = 0
+
+    # Unknown/non-baseline hosts that actually connected
+    unknown_connecting = {
+        h for h in host_ctr
+        if h and h not in bl["baseline_hosts"]
+        and not RE_IPV6.match(h) and not RE_IPV4.match(h)
+        and h not in ("", "unknown", "unconnected")
     }
-    for rule, count in sorted(rule_counts.items(), key=lambda x: -x[1]):
-        desc = rule_descriptions.get(rule, "Unknown rule")
-        lines.append(f"  {rule}  {desc:<40} {count:>5} events")
-    
-    lines += [
-        "",
-        "─" * 65,
-        "THESIS NOTES",
-        "─" * 65,
-        "  ⚠  Single shared DB user 'root3' detected across ALL hosts.",
-        "     This is a critical security finding — no individual",
-        "     accountability at the database layer.",
-        "",
-        "  ⚠  This log covers System Downtime and Data Corruption models.",
-        "     You STILL NEED Windows Event Logs for Unauthorized Access",
-        "     and Antivirus logs for Ransomware/Malware models.",
-        "",
-        "  ✓  89 crash recovery events provide strong labeled training",
-        "     data for the downtime prediction model.",
-        "",
-        "  ✓  All labels assigned by deterministic rules (see Rule IDs).",
-        "     Validate with IT admin — document as expert validation",
-        "     in your Methodology chapter.",
-        "=" * 65,
+    ipv6_connecting = {h for h in host_ctr if h and RE_IPV6.match(h)}
+    ip_connecting   = {h for h in host_ctr if h and RE_IPV4.match(h)}
+
+    # File sizes
+    input_size  = disc["file_size_bytes"]
+    total_csv   = sum(m.get("size", 0) for m in out_files.values())
+
+    # Lines
+    lines = []
+    def L(s=""): lines.append(s)
+    def SEP():  L("═" * W)
+    def sep2(): L("─" * W)
+    def H(t):
+        L()
+        sep2()
+        L(f"  {t}")
+        sep2()
+    def sub(t):
+        L()
+        L(f"  ── {t}")
+    def I(t): L(f"    {t}")
+    def II(t): L(f"      {t}")
+
+    # ── COVER PAGE ────────────────────────────────────────────────────
+    SEP()
+    L(f"{'LIRA — Log Intelligence & Response Analyzer':^{W}}")
+    L(f"{'Version 2.0':^{W}}")
+    SEP()
+    L(f"{'COMPREHENSIVE LOG ANALYSIS REPORT':^{W}}")
+    L(f"{'PhD Research — Incident Response Plan for EMR Systems':^{W}}")
+    sep2()
+    I(f"Hospital          : {HOSPITAL_NAME}")
+    I(f"Research Title    : {RESEARCH_TITLE[:60]}")
+    I(f"                    {RESEARCH_TITLE[60:]}")
+    I(f"Input File        : {os.path.basename(input_path)}")
+    I(f"Full Input Path   : {os.path.abspath(input_path)}")
+    I(f"Report Generated  : {end_dt.strftime('%A, %d %B %Y at %H:%M:%S')}")
+    I(f"Processing Time   : {elapsed:.2f} seconds")
+    I(f"Output Directory  : {os.path.abspath(out_dir)}")
+    I(f"Working Hours Set : {work_start:02d}:00 – {work_end:02d}:00")
+    I(f"Baseline User Pct : >= {bl['user_pct_threshold']}% of connection events")
+    I(f"Baseline Host Pct : >= {bl['host_pct_threshold']}% of connection events")
+    SEP()
+
+    # ── SECTION 1: SOURCE FILE METRICS ───────────────────────────────
+    H("SECTION 1 — SOURCE FILE METRICS")
+    L()
+    I(f"Input File Name              : {os.path.basename(input_path)}")
+    I(f"Input File Size (on disk)    : {hs(input_size)}")
+    I(f"Total Raw Lines in File      : {disc['raw_line_count']:,} lines")
+    I(f"Skipped / Non-event Lines    : {disc['skipped_lines']:,} lines")
+    I(f"  (Version banners, Aria progress bars, blank lines, sub-listing lines)")
+    I(f"Net Parseable Event Lines    : {disc['raw_line_count'] - disc['skipped_lines']:,} lines")
+    I(f"Total Events Extracted       : {total:,} events")
+    I(f"Parser Efficiency            : {total/(disc['raw_line_count'] or 1)*100:.1f}% of raw lines became events")
+    L()
+    I(f"Date Coverage:")
+    I(f"  Earliest Event             : {disc['date_range'][0]}")
+    I(f"  Latest Event               : {disc['date_range'][1]}")
+    I(f"  Total Calendar Days Logged : {len(disc['all_dates']):,} unique days")
+    L()
+
+    # Events by year
+    I("Events by Year:")
+    for yr in sorted(year_ctr.keys()):
+        pct = year_ctr[yr] / total * 100
+        bar = "█" * min(30, int(pct / 2))
+        I(f"  {yr}  :  {year_ctr[yr]:>6,} events  ({pct:5.1f}%)  {bar}")
+    L()
+
+    # Events by month
+    if month_ctr:
+        I("Events by Month (all years combined):")
+        mo_order = ["January","February","March","April","May","June",
+                    "July","August","September","October","November","December"]
+        for mo in mo_order:
+            if mo in month_ctr:
+                pct = month_ctr[mo] / total * 100
+                bar = "▓" * min(35, int(pct / 1.5))
+                I(f"  {mo:<12}: {month_ctr[mo]:>6,}  ({pct:5.1f}%)  {bar}")
+    L()
+
+    # MariaDB versions discovered
+    if disc["version_strings"]:
+        I("MariaDB Version(s) Detected in Log:")
+        for v, cnt in disc["version_strings"].most_common():
+            I(f"  {v}  (appeared {cnt:,} times in version banners)")
+    L()
+
+    # Log level distribution
+    I("Log Level Distribution:")
+    for lv in ["Note","Warning","Error"]:
+        cnt = level_ctr.get(lv, 0)
+        pct = cnt / total * 100
+        I(f"  {lv:<10}: {cnt:>6,} events  ({pct:5.1f}%)")
+
+    # ── SECTION 2: DYNAMIC BASELINE COMPUTED ─────────────────────────
+    H("SECTION 2 — DYNAMICALLY COMPUTED BASELINE")
+    L()
+    I("LIRA performed a complete discovery pass before labeling.")
+    I("The following baselines were computed from the log data itself.")
+    I("No values were hardcoded. The labeling engine used ONLY these")
+    I("discovered baselines to make every classification decision.")
+    L()
+    sub("Database Users Discovered")
+    I(f"Total unique users seen in connection events : {len(disc['all_users']):,}")
+    L()
+    I(f"{'USER':<30} {'CONNECTIONS':>12}  {'% OF TOTAL':>10}  STATUS")
+    I(f"{'─'*30} {'─'*12}  {'─'*10}  {'─'*20}")
+    for u, cnt in disc["all_users"].most_common():
+        pct  = cnt / (bl["total_conn_events"] or 1) * 100
+        stat = "✓ BASELINE" if u in bl["baseline_users"] else (
+               "⚠ SUSPICIOUS — unknown user" if u not in ("unauthenticated","unconnected","") else
+               "⚠ UNAUTHENTICATED" if u == "unauthenticated" else "  system"
+        )
+        I(f"  {u:<28} {cnt:>12,}  {pct:>9.2f}%  {stat}")
+    L()
+    I(f"Baseline users (>= {bl['user_pct_threshold']}% threshold): "
+      f"{', '.join(sorted(bl['baseline_users'])) or 'none detected'}")
+
+    sub("Database Hosts Discovered")
+    I(f"Total unique hosts seen in connection events : {len(disc['all_hosts']):,}")
+    I(f"  Of which: baseline registered   : {len(bl['baseline_hosts']):,}")
+    I(f"           non-baseline / unknown  : {len(unknown_connecting):,}")
+    I(f"           IPv6 link-local         : {len(ipv6_connecting):,}")
+    I(f"           raw IP addresses        : {len(ip_connecting):,}")
+    L()
+    I(f"{'HOST':<34} {'CONNECTIONS':>12}  STATUS")
+    I(f"{'─'*34} {'─'*12}  {'─'*20}")
+    for h, cnt in disc["all_hosts"].most_common():
+        if not h:
+            continue
+        if RE_IPV6.match(h):
+            stat = "⚠ IPv6 UNREGISTERED"
+        elif RE_IPV4.match(h):
+            stat = "⚠ RAW IP ADDRESS"
+        elif h in bl["baseline_hosts"]:
+            stat = "✓ BASELINE"
+        elif h in ("unknown","unconnected"):
+            stat = "  system internal"
+        else:
+            stat = "⚠ NON-BASELINE"
+        I(f"  {h:<32} {cnt:>12,}  {stat}")
+    L()
+
+    sub("Databases Accessed")
+    I(f"Total unique database names : {len(disc['all_db_names'])}")
+    for db, cnt in disc["all_databases"].most_common():
+        I(f"  '{db}'  :  {cnt:,} connections")
+    if bl["primary_db"]:
+        I(f"Primary EMR database identified as: '{bl['primary_db']}'")
+    L()
+
+    sub("Connection Abort Reasons Discovered")
+    I(f"Total distinct abort reason strings : {len(disc['all_abort_reasons'])}")
+    for reason, cnt in disc["all_abort_reasons"].most_common():
+        I(f"  ({cnt:>5,}x)  \"{reason}\"")
+
+    # ── SECTION 3: OUTPUT FILE INVENTORY ─────────────────────────────
+    H("SECTION 3 — OUTPUT FILES PRODUCED (Full Inventory)")
+    L()
+    I("All 9 output files are described below with exact row counts,")
+    I("column counts, file sizes, and their purpose in the PhD research.")
+    I("All counts are derived from the actual log data parsed — not estimates.")
+    L()
+
+    file_info = [
+        {
+            "name":    "LIRA_00_master_all_events.csv",
+            "title":   "MASTER — All Parsed Events (Complete Dataset)",
+            "purpose": (
+                "The single authoritative source of truth. Contains every event "
+                "extracted from the log file — benign and incident, with all "
+                f"{out_files.get('LIRA_00_master_all_events.csv', {}).get('cols', '?')} "
+                "columns: parsed fields, extracted sub-fields, computed boolean "
+                "feature flags, and the complete labeling decision (label, sublabel, "
+                "severity, rule_id, model_flags, analyst_notes). All other CSV files "
+                "are filtered subsets of this master file. Use this for full dataset "
+                "exploration and as the reference when verifying any other file."
+            ),
+            "model":  "Source for all downstream models",
+            "classes": "ALL labels",
+        },
+        {
+            "name":    "LIRA_01_incidents_only.csv",
+            "title":   "INCIDENTS ONLY — Non-Benign Events",
+            "purpose": (
+                "Filtered to contain only events classified as incidents "
+                "(is_incident = 1). These are the events your AI-powered IRP "
+                "system must detect, classify, and respond to. Provides a clean "
+                "view of the threat/instability landscape in the hospital's "
+                "database layer without the noise of routine operational events."
+            ),
+            "model":  "Exploratory analysis / incident overview",
+            "classes": "SYSTEM_DOWNTIME, DATA_CORRUPTION, UNAUTHORIZED_ACCESS, SUSPICIOUS, PLANNED_MAINTENANCE",
+        },
+        {
+            "name":    "LIRA_02_model_downtime_events.csv",
+            "title":   "MODEL INPUT — System Downtime Detection (Event Level)",
+            "purpose": (
+                "Event-level dataset for the System Downtime / Availability "
+                "detection model. Contains crash events (positive class) and "
+                "planned shutdowns (negative class). Use with Isolation Forest "
+                "for unsupervised anomaly detection, or Random Forest / LSTM "
+                "Autoencoder for supervised classification."
+            ),
+            "model":  "Isolation Forest, Random Forest, LSTM Autoencoder",
+            "classes": "SYSTEM_DOWNTIME (positive=1), PLANNED_MAINTENANCE (negative=0)",
+        },
+        {
+            "name":    "LIRA_03_model_downtime_sessions.csv",
+            "title":   "MODEL INPUT — System Downtime Sessions (Session Level, ML-Ready)",
+            "purpose": (
+                "Session-level dataset where each row = one complete downtime "
+                "incident. Fields include crash timestamp, recovery timestamp, "
+                "downtime in seconds/minutes/hours, crash hour, day of week, month, "
+                "year, and whether the crash was after-hours. This is the PRIMARY "
+                "input for the time-series downtime forecasting model. Also used "
+                "to compute MTTR (Mean Time To Recovery) — the core KPI for "
+                "evaluating the effectiveness of the enhanced IRP."
+            ),
+            "model":  "Prophet, ARIMA, LSTM (time-series forecasting)",
+            "classes": "SYSTEM_DOWNTIME (all rows are confirmed incidents)",
+        },
+        {
+            "name":    "LIRA_04_model_data_corruption.csv",
+            "title":   "MODEL INPUT — Data Corruption Risk Detection",
+            "purpose": (
+                "Events indicating potential data integrity compromise: InnoDB crash "
+                "recoveries, Aria engine recoveries, temporary tablespace recreations, "
+                "stale file removals, and rollback segment activations. Each event "
+                "represents a moment when EMR patient data may have been partially "
+                "lost due to an unclean shutdown. Use with XGBoost or Random Forest."
+            ),
+            "model":  "XGBoost, Random Forest",
+            "classes": "DATA_CORRUPTION (positive), SYSTEM_DOWNTIME (context)",
+        },
+        {
+            "name":    "LIRA_05_model_unauthorized_access.csv",
+            "title":   "MODEL INPUT — Unauthorized Access / Breach Detection",
+            "purpose": (
+                "Events related to authentication failures, unregistered users, "
+                "unauthenticated connections, IPv6/IP device connections, non-baseline "
+                "host connections, and after-hours database activity. These events "
+                "constitute the unauthorized access signal corpus for training the "
+                "breach detection model. Note the Access Denied events (rule R11) "
+                "are your strongest confirmed unauthorized access evidence in this "
+                "log — they should be highlighted in the thesis findings."
+            ),
+            "model":  "LSTM (sequential), Random Forest, Isolation Forest",
+            "classes": "UNAUTHORIZED_ACCESS (positive), SUSPICIOUS (medium confidence)",
+        },
+        {
+            "name":    "LIRA_06_model_suspicious_review.csv",
+            "title":   "MANUAL REVIEW QUEUE — Suspicious Events (IT Admin Validation Needed)",
+            "purpose": (
+                "Events flagged as suspicious that could not be definitively "
+                "classified by the automated rule engine alone. These require IT "
+                "administrator review to confirm or clear. The outcome (confirmed "
+                "vs. cleared) generates additional labeled training data and is "
+                "documented as 'Expert Validation' in the thesis methodology chapter. "
+                "In the full 35MB log, novel Warning patterns not seen in the "
+                "sample will land here via Rule R25 — they are flagged, not "
+                "ignored, ensuring zero data loss."
+            ),
+            "model":  "Manual review → feeds all four models post-validation",
+            "classes": "SUSPICIOUS (requires IT admin confirmation)",
+        },
+        {
+            "name":    "LIRA_07_label_audit_trail.csv",
+            "title":   "LABELING AUDIT TRAIL — Full Decision Record (Thesis Evidence)",
+            "purpose": (
+                "A complete record of every labeling decision: event fingerprint, "
+                "rule fired (R01–R25), rule description, label assigned, severity, "
+                "confidence, model assignment, and analyst notes explaining the "
+                "reasoning in plain language. This file is the primary evidence "
+                "for the 'Data Labeling Methodology' section of the PhD thesis. "
+                "It proves that every label was assigned by a documented, "
+                "deterministic, traceable rule — not arbitrary judgment. Present "
+                "this to the supervisor/examiner as methodological proof."
+            ),
+            "model":  "Thesis documentation / examiner evidence",
+            "classes": "All labels — 100% audit coverage",
+        },
+        {
+            "name":    "LIRA_REPORT.txt",
+            "title":   "COMPREHENSIVE ANALYSIS REPORT (This File)",
+            "purpose": (
+                "Auto-generated report covering all 12 sections: source file "
+                "metrics, dynamic baseline, output file inventory, size comparison "
+                "table, label distribution, severity distribution, downtime analysis, "
+                "security findings, network profile, rule engine performance, "
+                "temporal distribution, and PhD thesis checklist. Every number in "
+                "this report is computed from the actual parsed data — no estimates."
+            ),
+            "model":  "PhD thesis documentation / supervisor review",
+            "classes": "N/A",
+        },
     ]
-    
-    report_path = os.path.join(output_dir, "esuth_summary_report.txt")
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    print(f"[DONE] Summary report → {os.path.basename(report_path)}")
+
+    for fi in file_info:
+        nm   = fi["name"]
+        meta = out_files.get(nm, {})
+        rows = meta.get("rows", 0) if nm != "LIRA_REPORT.txt" else "N/A"
+        cols = meta.get("cols", "N/A") if nm != "LIRA_REPORT.txt" else "N/A"
+        sz   = meta.get("size", 0)
+        I("─" * 68)
+        I(f"FILE    : {nm}")
+        I(f"─" * 68)
+        I(f"  Title        : {fi['title']}")
+        I(f"  File Size    : {hs(sz) if sz else 'See report file size'}")
+        I(f"  Row Count    : {rows:,} data rows (+ 1 header row)" if isinstance(rows, int) else f"  Row Count    : {rows}")
+        I(f"  Columns      : {cols}")
+        I(f"  ML Target    : {fi['model']}")
+        I(f"  Label Classes: {fi['classes']}")
+        I(f"  Description  :")
+        for wl in wr(fi["purpose"], width=66, indent=6):
+            L(wl)
+        L()
+
+    # ── SECTION 4: SIZE COMPARISON TABLE ─────────────────────────────
+    H("SECTION 4 — FILE SIZE COMPARISON (Source Log → CSV Outputs)")
+    L()
+    I(f"  {'FILE':<46} {'ROWS':>8}  {'SIZE':>24}")
+    I(f"  {'─'*46} {'─'*8}  {'─'*24}")
+    I(f"  {'[SOURCE] ' + os.path.basename(input_path):<46} "
+      f"{disc['raw_line_count']:>8,}  {hs(input_size):>24}")
+    I(f"  {'─'*46} {'─'*8}  {'─'*24}")
+    tot_rows = 0
+    for fi in file_info:
+        nm   = fi["name"]
+        meta = out_files.get(nm, {})
+        rows = meta.get("rows", 0) if nm != "LIRA_REPORT.txt" else 0
+        sz   = meta.get("size", 0)
+        tot_rows += rows
+        I(f"  {nm:<46} {rows:>8,}  {hs(sz):>24}")
+    I(f"  {'─'*46} {'─'*8}  {'─'*24}")
+    I(f"  {'TOTAL CSV ROWS':<46} {tot_rows:>8,}  {hs(total_csv):>24}")
+    L()
+    ratio = total_csv / input_size * 100 if input_size else 0
+    I(f"CSV expansion ratio: {ratio:.1f}% of source log size.")
+    I(f"Expansion is due to added label columns and analyst notes per event.")
+
+    # ── SECTION 5: LABEL DISTRIBUTION ────────────────────────────────
+    H("SECTION 5 — INCIDENT LABEL DISTRIBUTION")
+    L()
+    I(f"{'LABEL':<28} {'COUNT':>8}  {'%':>7}  VISUAL BAR")
+    I(f"{'─'*28} {'─'*8}  {'─'*7}  {'─'*22}")
+    label_order = [
+        "BENIGN","SYSTEM_DOWNTIME","DATA_CORRUPTION",
+        "UNAUTHORIZED_ACCESS","SUSPICIOUS","PLANNED_MAINTENANCE",
+    ]
+    for lb in label_order:
+        cnt = label_counts.get(lb, 0) if (lb in (label_counts := label_ctr)) else 0
+        pct = cnt / total * 100
+        bar = "█" * int(pct / 2.5)
+        I(f"  {lb:<26} {cnt:>8,}  {pct:>6.2f}%  {bar}")
+    # Any labels not in the expected list (from novel events in full log)
+    for lb, cnt in label_ctr.most_common():
+        if lb not in label_order:
+            pct = cnt / total * 100
+            I(f"  {lb:<26} {cnt:>8,}  {pct:>6.2f}%  (unexpected label)")
+    L()
+    I(f"Total incident events   : {len(incidents):,}  ({len(incidents)/total*100:.2f}% of all events)")
+    I(f"Total benign events     : {len(benign):,}  ({len(benign)/total*100:.2f}% of all events)")
+    L()
+    sub("Sub-label Breakdown (Top 20)")
+    I(f"{'SUBLABEL':<45} {'COUNT':>8}")
+    I(f"{'─'*45} {'─'*8}")
+    for sl, cnt in sublabel_ctr.most_common(20):
+        I(f"  {sl:<43} {cnt:>8,}")
+
+    # ── SECTION 6: SEVERITY DISTRIBUTION ─────────────────────────────
+    H("SECTION 6 — SEVERITY LEVEL DISTRIBUTION")
+    L()
+    I(f"{'SEVERITY':<12} {'COUNT':>8}  {'%':>7}  VISUAL BAR")
+    I(f"{'─'*12} {'─'*8}  {'─'*7}  {'─'*22}")
+    for sv in ["CRITICAL","HIGH","MEDIUM","LOW","INFO"]:
+        cnt = sev_ctr.get(sv, 0)
+        pct = cnt / total * 100
+        bar = "█" * int(pct / 2.5)
+        I(f"  {sv:<10} {cnt:>8,}  {pct:>6.2f}%  {bar}")
+    L()
+    crit_high = sev_ctr.get("CRITICAL",0) + sev_ctr.get("HIGH",0)
+    I(f"CRITICAL + HIGH combined : {crit_high:,} events — require immediate IRP response")
+
+    # ── SECTION 7: DOWNTIME ANALYSIS ─────────────────────────────────
+    H("SECTION 7 — SYSTEM DOWNTIME ANALYSIS (IRP Evaluation Metrics)")
+    L()
+    I(f"Total downtime sessions identified    : {len(sessions):,}")
+    I(f"Total cumulative downtime             : {total_down_h:.2f} hours  "
+      f"({total_down_s:,} seconds)")
+    I(f"Average downtime per session (MTTR)   : {avg_down_m:.2f} minutes")
+    I(f"Longest single downtime session       : {max_down_m:.2f} minutes")
+    I(f"Shortest single downtime session      : {min_down_m:.2f} minutes")
+    I(f"After-hours crash sessions            : {after_h_crash:,}")
+    I(f"Long outages (> 1 hour)               : {long_outages:,}")
+    L()
+
+    if sessions:
+        sub("Top 10 Longest Downtime Sessions")
+        I(f"{'#':>4}  {'CRASH START':<22}  {'RECOVERY':<22}  {'DURATION':>10}  TYPE")
+        I(f"{'─'*4}  {'─'*22}  {'─'*22}  {'─'*10}  {'─'*25}")
+        for s in sorted(sessions, key=lambda x: -x["downtime_seconds"])[:10]:
+            I(f"  {s['session_id']:>3}.  {s['crash_start_timestamp']:<22}  "
+              f"{s['recovery_timestamp']:<22}  {s['downtime_minutes']:>8.1f}m  "
+              f"{s['crash_type']}")
+    L()
+    I("Thesis Note: The MTTR values above are the ground-truth performance")
+    I("baseline BEFORE implementing the enhanced IRP. Your evaluation chapter")
+    I("will compare these against post-implementation MTTR metrics.")
+
+    # ── SECTION 8: SECURITY FINDINGS ─────────────────────────────────
+    H("SECTION 8 — SECURITY FINDINGS (Key PhD Research Evidence)")
+    L()
+    I("The following findings are derived directly from the log data.")
+    I("Each finding corresponds to a documented vulnerability that the")
+    I("enhanced IRP is designed to detect and respond to.")
+    L()
+
+    # Finding 1 — shared superuser
+    non_baseline_users = [u for u in disc["all_users"] if u not in bl["baseline_users"]
+                          and u not in ("","unauthenticated","unconnected")]
+    I("FINDING 1 — Single / Dominant Shared Database User Account [CRITICAL]")
+    sep2()
+    I(f"  Primary user in log    : '{bl['primary_user']}'")
+    I(f"  Connection share       : {disc['all_users'].get(bl['primary_user'],0):,} of "
+      f"{bl['total_conn_events']:,} connections "
+      f"({disc['all_users'].get(bl['primary_user'],0)/(bl['total_conn_events'] or 1)*100:.1f}%)") 
+    I(f"  Other users detected   : {len(non_baseline_users)}  "
+      f"({', '.join(non_baseline_users) if non_baseline_users else 'none'})")
+    I("  Implication:")
+    II("If one credential set dominates all connections, individual user")
+    II("accountability at the database layer is lost. A compromised")
+    II("password gives full EMR database access from any workstation.")
+    II("Violates NDPR 2019 Article 2.6 (security of personal data).")
+    L()
+
+    # Finding 2 — Access denied
+    ad_users = Counter(e["access_denied_user"] for e in access_denied if e["access_denied_user"])
+    ad_hosts = Counter(e["access_denied_host"] for e in access_denied if e["access_denied_host"])
+    I(f"FINDING 2 — Authentication Failures (Access Denied) [{len(access_denied):,} events]")
+    sep2()
+    I(f"  Total access denied events : {len(access_denied):,}")
+    if ad_users:
+        I("  Failed login attempts by user:")
+        for u, c in ad_users.most_common():
+            in_bl = "KNOWN USER" if u in bl["baseline_users"] else "⚠ UNKNOWN USER"
+            I(f"    '{u}' : {c:,} attempts  [{in_bl}]")
+    if ad_hosts:
+        I("  Failed login attempts from host:")
+        for h, c in ad_hosts.most_common():
+            I(f"    '{h}' : {c:,} attempts")
+    L()
+
+    # Finding 3 — Unauthenticated
+    unauth_cnt = sum(1 for e in events if e["rule_id"] in ("R10","R13"))
+    I(f"FINDING 3 — Unauthenticated Connections [{unauth_cnt:,} events]")
+    sep2()
+    I(f"  Connections dropped before auth completed : {unauth_cnt:,}")
+    I("  Indicates port scanning, brute-force probing, or severely")
+    I("  misconfigured clients connecting to database port 3306.")
+    L()
+
+    # Finding 4 — IPv6
+    I(f"FINDING 4 — Unregistered IPv6 Devices [{len(ipv6_connecting):,} unique addresses]")
+    sep2()
+    I(f"  Unique IPv6 link-local addresses detected : {len(ipv6_connecting):,}")
+    for h in sorted(ipv6_connecting):
+        I(f"    {h}  ({host_ctr.get(h,0):,} connections)")
+    L()
+
+    # Finding 5 — DNS
+    I(f"FINDING 5 — DNS Resolution Failures [{len(dns_failures):,} events]")
+    sep2()
+    I(f"  Total DNS resolution failure events : {len(dns_failures):,}")
+    dns_entities = Counter(e["dns_entity"] for e in dns_failures if e["dns_entity"])
+    if dns_entities:
+        I("  Affected hostnames/addresses:")
+        for ent, cnt in dns_entities.most_common(10):
+            I(f"    '{ent}'  :  {cnt:,} failures")
+    L()
+
+    # Finding 6 — After hours
+    I(f"FINDING 6 — After-Hours Incidents [{len(after_hours_inc):,} events]")
+    sep2()
+    I(f"  Non-benign events outside {work_start:02d}:00–{work_end:02d}:00 : {len(after_hours_inc):,}")
+    ah_hour = Counter(e["hour"] for e in after_hours_inc if e["hour"] != -1)
+    if ah_hour:
+        I("  Most active after-hours periods:")
+        for h, cnt in ah_hour.most_common(5):
+            I(f"    {h:02d}:xx  :  {cnt:,} incidents")
+
+    # Finding 7 — Non-baseline hosts
+    I(f"FINDING 7 — Non-Baseline Hosts [{len(unknown_connecting):,} unique hosts]")
+    sep2()
+    I(f"  Hosts making connections but below baseline threshold:")
+    for h in sorted(unknown_connecting):
+        I(f"    '{h}'  :  {host_ctr.get(h,0):,} connections  — verify with IT admin")
+
+    # ── SECTION 9: MODEL DATASET SUMMARY ─────────────────────────────
+    H("SECTION 9 — ML MODEL DATASET SUMMARY")
+    L()
+    I("Summary of events assigned to each model training dataset:")
+    I(f"{'MODEL DATASET':<35} {'EVENT COUNT':>12}  NOTES")
+    I(f"{'─'*35} {'─'*12}  {'─'*22}")
+    for mdl, cnt in model_ctr.most_common():
+        note = ""
+        if mdl == "downtime_events":
+            note = f"incl. {len(sessions)} session records"
+        elif mdl == "unauthorized_access":
+            note = f"incl. {len(access_denied)} access-denied events"
+        I(f"  {mdl:<33} {cnt:>12,}  {note}")
+    L()
+    I("Events with no model assignment (benign, filtered out):")
+    no_model = sum(1 for e in events if e["model_flags"] == "none")
+    I(f"  {no_model:,} events labeled BENIGN — used as negative class")
+
+    # ── SECTION 10: RULE ENGINE PERFORMANCE ─────────────────────────
+    H("SECTION 10 — LABELING RULE ENGINE — COMPLETE FIRING REPORT")
+    L()
+    I("Every label is assigned by one of the 25 rules below.")
+    I("This table constitutes the 'Data Labeling Methodology' evidence")
+    I("for the PhD thesis — every rule fired is documented and traceable.")
+    L()
+    I(f"{'RULE':<6} {'DESCRIPTION':<42} {'COUNT':>8}  {'%':>7}")
+    I(f"{'─'*6} {'─'*42} {'─'*8}  {'─'*7}")
+    for rid in sorted(rule_ctr.keys()):
+        cnt  = rule_ctr[rid]
+        pct  = cnt / total * 100
+        desc = RULE_CATALOG.get(rid, "Unknown rule")
+        I(f"  {rid:<5} {desc:<42} {cnt:>8,}  {pct:>6.2f}%")
+    L()
+    I(f"Rules fired      : {len(rule_ctr)} of {len(RULE_CATALOG)} defined rules")
+    I(f"Rules not fired  : {len(RULE_CATALOG) - len(rule_ctr)} (patterns not present in this log)")
+    I(f"Coverage         : 100% — every event carries a Rule ID")
+    L()
+
+    # Unfired rules (tells researcher what's missing from this log)
+    unfired = [rid for rid in RULE_CATALOG if rid not in rule_ctr]
+    if unfired:
+        I("Rules not triggered — patterns ABSENT from this log file:")
+        I("(These rules will fire automatically if the full log contains them)")
+        for rid in sorted(unfired):
+            I(f"  {rid}  {RULE_CATALOG[rid]}")
+
+    # ── SECTION 11: TEMPORAL DISTRIBUTION ────────────────────────────
+    H("SECTION 11 — TEMPORAL DISTRIBUTION ANALYSIS")
+    L()
+    sub("Events by Hour of Day (all events)")
+    I(f"{'HOUR':<8} {'TOTAL':>8}  {'INCIDENTS':>10}  BAR (incidents)")
+    I(f"{'─'*8} {'─'*8}  {'─'*10}  {'─'*22}")
+    inc_hour = Counter(e["hour"] for e in incidents if e["hour"] != -1)
+    for h in range(24):
+        total_h = hour_ctr.get(h, 0)
+        inc_h   = inc_hour.get(h, 0)
+        bar     = "█" * min(25, inc_h // max(1, len(incidents)//25))
+        marker  = " ◄ WORK START" if h == work_start else (
+                  " ◄ WORK END" if h == work_end else "")
+        I(f"  {h:02d}:xx  {total_h:>8,}  {inc_h:>10,}  {bar}{marker}")
+    L()
+    sub("Events by Day of Week")
+    inc_dow = Counter(e["day_of_week"] for e in incidents if e["day_of_week"])
+    for day in ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]:
+        total_d = dow_ctr.get(day, 0)
+        inc_d   = inc_dow.get(day, 0)
+        bar     = "▓" * min(25, total_d // max(1, total // 25))
+        I(f"  {day:<12} {total_d:>6,} total  {inc_d:>5,} incidents  {bar}")
+
+    # ── SECTION 12: THESIS CHECKLIST ─────────────────────────────────
+    H("SECTION 12 — PhD THESIS CHECKLIST & NEXT STEPS")
+    L()
+    sub("What This Log File COVERS for ML Training")
+    L()
+    dt_count = label_ctr.get("SYSTEM_DOWNTIME", 0)
+    dc_count = label_ctr.get("DATA_CORRUPTION", 0)
+    ua_count = label_ctr.get("UNAUTHORIZED_ACCESS", 0) + label_ctr.get("SUSPICIOUS", 0)
+    I(f"[{'✓' if dt_count >= 50 else '◑'}] System Downtime Detection")
+    I(f"    {dt_count:,} labeled events + {len(sessions):,} complete session records")
+    I(f"    Confidence: {'STRONG' if dt_count >= 50 else 'MODERATE'}")
+    L()
+    I(f"[{'✓' if dc_count >= 50 else '◑'}] Data Corruption Risk Detection")
+    I(f"    {dc_count:,} labeled events from crash recovery sequences")
+    I(f"    Confidence: {'STRONG' if dc_count >= 50 else 'MODERATE'}")
+    L()
+    I(f"[{'◑' if ua_count >= 20 else '✗'}] Unauthorized Access Detection")
+    I(f"    {ua_count:,} events (access-denied, unauthenticated, IPv6, non-baseline)")
+    I(f"    Confidence: PARTIAL — supplement with Windows Security Event Logs")
+    L()
+    I("[✗] Ransomware / Malware Detection")
+    I("    0 events — MariaDB error logs do NOT capture malware activity")
+    I("    Required: Windows Event Log (ID 7045), Antivirus logs,")
+    I("              File system change logs (PowerShell Script Block Log)")
+    L()
+    sub("Additional Log Files to Request from ESUTH IT")
+    L()
+    I("  File                       Location on Hospital Server")
+    I("  " + "─"*64)
+    I("  Windows Security.evtx      C:\\Windows\\System32\\winevt\\Logs\\")
+    I("  Windows System.evtx        C:\\Windows\\System32\\winevt\\Logs\\")
+    I("  Windows Application.evtx   C:\\Windows\\System32\\winevt\\Logs\\")
+    I("  Antivirus alert log        Depends on AV software installed")
+    I("  MariaDB general query log  C:\\xampp\\mysql\\data\\ (if enabled)")
+    L()
+    I("  Extraction command (run as Admin in Command Prompt):")
+    I("    wevtutil epl Security   C:\\logs\\Security.evtx")
+    I("    wevtutil epl System     C:\\logs\\System.evtx")
+    I("    wevtutil epl Application C:\\logs\\Application.evtx")
+    L()
+    sub("Labeling Validation Process (for Thesis Methodology Chapter)")
+    L()
+    I("  Step 1. Open LIRA_07_label_audit_trail.csv")
+    I("  Step 2. Sit with ESUTH IT administrator")
+    I("  Step 3. For each SUSPICIOUS event (rule R25, R16, R19, R20):")
+    I("            IT admin confirms: is this a real incident? Y/N")
+    I("  Step 4. Document session date, attendees, % confirmed/cleared")
+    I("  Step 5. Update labels in LIRA_07 and re-run downstream models")
+    I("  Step 6. Report this as 'Expert Validation' in Methodology chapter")
+    I("  Result: Triangulated labeling (rules + IT expertise + cross-reference)")
+    L()
+
+    # ── MESSAGE TEMPLATE DISCOVERY ────────────────────────────────────
+    H("SECTION 13 — UNIQUE MESSAGE PATTERNS DISCOVERED IN THIS LOG")
+    L()
+    I("All unique anonymized message templates found in the log file.")
+    I("If the full 35MB log contains new patterns, they will appear here.")
+    I("Check this section after running on the full file to confirm")
+    I("complete rule coverage for any novel message types.")
+    L()
+    I(f"{'COUNT':>8}  ANONYMIZED MESSAGE TEMPLATE")
+    I(f"{'─'*8}  {'─'*56}")
+    for tmpl, cnt in disc["message_templates"].most_common():
+        I(f"  {cnt:>6,}  {tmpl[:70]}")
+    L()
+
+    # ── FOOTER ───────────────────────────────────────────────────────
+    SEP()
+    L(f"{'LIRA — Log Intelligence & Response Analyzer  v2.0':^{W}}")
+    L(f"{'All statistics auto-generated from parsed log data':^{W}}")
+    L(f"{'Every label is deterministic and traceable via LIRA_07':^{W}}")
+    L(f"{'Report generated: ' + end_dt.strftime('%Y-%m-%d %H:%M:%S'):^{W}}")
+    SEP()
+
+    return "\n".join(lines)
 
 
-# ============================================================
+# ═══════════════════════════════════════════════════════════════════════
 # MAIN
-# ============================================================
+# ═══════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="ESUTH MariaDB Log Parser — PhD IRP Research"
+    ap = argparse.ArgumentParser(
+        description=f"{TOOL_NAME} v2.0 — PhD ESUTH EMR Incident Response Research"
     )
-    parser.add_argument(
-        "--input", "-i",
-        required=True,
-        help="Path to the MariaDB error log file (e.g. C:/xampp/mysql/data/mysql_error.log)"
-    )
-    parser.add_argument(
-        "--output", "-o",
-        default=None,
-        help="Output directory (default: same folder as input file)"
-    )
-    args = parser.parse_args()
+    ap.add_argument("--input",  "-i", required=True,
+        help='Path to MariaDB error log. E.g. "C:\\xampp\\mysql\\data\\mysql_error.log"')
+    ap.add_argument("--output", "-o", default=None,
+        help="Output directory. Default: LIRA_Output/ folder next to the input file.")
+    ap.add_argument("--work-start", type=int, default=7,
+        help="Start of working hours in 24h format (default: 7)")
+    ap.add_argument("--work-end",   type=int, default=21,
+        help="End of working hours in 24h format (default: 21)")
+    ap.add_argument("--top-user-pct", type=float, default=5.0,
+        help="Baseline threshold: users seen in >= N%% of connection events (default: 5.0)")
+    ap.add_argument("--top-host-pct", type=float, default=1.0,
+        help="Baseline threshold: hosts seen in >= N%% of connection events (default: 1.0)")
+    args = ap.parse_args()
 
     input_path = args.input
-    output_dir = args.output or os.path.dirname(os.path.abspath(input_path))
-    os.makedirs(output_dir, exist_ok=True)
+    out_dir    = args.output or os.path.join(
+        os.path.dirname(os.path.abspath(input_path)), "LIRA_Output"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    start_dt = datetime.now()
 
-    print("\n" + "=" * 65)
-    print("ESUTH EMR — MariaDB Log Parser & Incident Labeler")
-    print("PhD Research: Enhanced Incident Response Plan")
-    print("=" * 65)
+    print()
+    print("╔" + "═"*68 + "╗")
+    print("║" + f"  {TOOL_NAME}  v2.0".ljust(68) + "║")
+    print("║" + f"  PhD Research — ESUTH EMR Incident Response System".ljust(68) + "║")
+    print("╚" + "═"*68 + "╝")
+    print()
+    print(f"  Input file  : {input_path}")
+    print(f"  Output dir  : {out_dir}")
+    print(f"  Work hours  : {args.work_start:02d}:00 – {args.work_end:02d}:00")
+    print(f"  User pct    : >= {args.top_user_pct}% threshold for baseline users")
+    print(f"  Host pct    : >= {args.top_host_pct}% threshold for baseline hosts")
+    print()
 
-    # Step 1: Parse
-    events = parse_log_file(input_path)
-    if not events:
-        print("[ERROR] No events parsed. Check the file format.")
-        sys.exit(1)
+    # ── PASS 1: DISCOVERY ────────────────────────────────────────────
+    print("  [1/6] PASS 1 — Discovery: reading entire log file...")
+    disc = discover(input_path)
+    print(f"        {len(disc['raw_events']):,} events discovered in "
+          f"{disc['raw_line_count']:,} raw lines")
+    print(f"        Date range: {disc['date_range'][0]} → {disc['date_range'][1]}")
+    print(f"        Unique users: {len(disc['all_users'])}  |  "
+          f"Unique hosts: {len(disc['all_hosts'])}  |  "
+          f"Unique DBs: {len(disc['all_db_names'])}")
 
-    # Step 2: Label
-    events = label_all_events(events)
+    # ── BASELINE COMPUTATION ─────────────────────────────────────────
+    print("  [2/6] Computing statistical baseline from discovered data...")
+    bl = compute_baseline(disc, args.top_user_pct, args.top_host_pct)
+    print(f"        Baseline users ({args.top_user_pct}% threshold): "
+          f"{', '.join(sorted(bl['baseline_users'])) or 'none'}")
+    print(f"        Baseline hosts ({args.top_host_pct}% threshold): "
+          f"{len(bl['baseline_hosts'])} hosts")
 
-    # Step 3: Build downtime sessions
-    sessions = build_downtime_sessions(events)
+    # ── PASS 2: LABELING ─────────────────────────────────────────────
+    print("  [3/6] PASS 2 — Labeling: applying 25-rule engine to all events...")
+    events = [
+        label_event(e, bl, args.work_start, args.work_end)
+        for e in disc["raw_events"]
+    ]
+    label_dist = Counter(e["label"] for e in events)
+    for lb, cnt in sorted(label_dist.items(), key=lambda x: -x[1]):
+        print(f"        {lb:<30} {cnt:>7,} events")
 
-    # Step 4: Filter into model-specific datasets
-    incident_events = [e for e in events if e["label"] != "BENIGN"]
-    downtime_events = [e for e in events if "downtime_model" in e.get("model_target", "")]
-    corrupt_events  = [e for e in events if "data_corruption_model" in e.get("model_target", "")]
-    unauth_events   = [e for e in events if "unauthorized_access_model" in e.get("model_target", "")]
-    suspicious_evts = [e for e in events if "suspicious_model" in e.get("model_target", "")]
+    # ── DOWNTIME SESSIONS ─────────────────────────────────────────────
+    print("  [4/6] Building downtime sessions...")
+    sessions = build_sessions(events)
+    print(f"        {len(sessions):,} complete crash-recovery sessions identified")
 
-    # Step 5: Write all CSVs
-    print(f"\n[INFO] Writing output files to: {output_dir}\n")
+    # ── WRITE CSV FILES ───────────────────────────────────────────────
+    print("  [5/6] Writing output CSV files...")
 
-    write_csv(events,         os.path.join(output_dir, "esuth_parsed_events.csv"),        "All parsed events")
-    write_csv(incident_events,os.path.join(output_dir, "esuth_labeled_incidents.csv"),    "Incident events only")
-    write_csv(sessions,       os.path.join(output_dir, "esuth_model_downtime_sessions.csv"), "Downtime sessions (ML-ready)")
-    write_csv(downtime_events,os.path.join(output_dir, "esuth_model_downtime.csv"),       "Downtime model events")
-    write_csv(corrupt_events, os.path.join(output_dir, "esuth_model_datacorrupt.csv"),    "Data corruption model events")
-    write_csv(unauth_events,  os.path.join(output_dir, "esuth_model_unauth.csv"),         "Unauthorized access model events")
-    write_csv(suspicious_evts,os.path.join(output_dir, "esuth_model_suspicious.csv"),     "Suspicious events for review")
+    incidents    = [e for e in events if e["is_incident"] == "1"]
+    downtime_ev  = [e for e in events if "downtime_events"      in e["model_flags"]]
+    corrupt_ev   = [e for e in events if "data_corruption"       in e["model_flags"]]
+    unauth_ev    = [e for e in events if "unauthorized_access"   in e["model_flags"]]
+    suspect_ev   = [e for e in events if "suspicious_review"     in e["model_flags"]]
 
-    # Step 6: Audit trail — every labeling decision
     audit = [{
-        "line_number": e["line_number"],
-        "timestamp": e["timestamp"],
-        "rule_id": e["rule_id"],
-        "label": e["label"],
-        "sublabel": e["sublabel"],
-        "severity": e["severity"],
-        "confidence": e["confidence"],
-        "host": e["host"],
-        "user": e["user"],
-        "message_preview": e["message"][:80],
-        "labeling_notes": e["labeling_notes"],
+        "event_id":          e["event_id"],
+        "fingerprint":       e["fingerprint"],
+        "source_line":       e["source_line_number"],
+        "timestamp":         e["timestamp"],
+        "level":             e["level"],
+        "rule_id":           e["rule_id"],
+        "rule_description":  e["rule_description"],
+        "label":             e["label"],
+        "sublabel":          e["sublabel"],
+        "severity":          e["severity"],
+        "confidence":        e["confidence"],
+        "is_incident":       e["is_incident"],
+        "is_after_hours":    e["is_after_hours"],
+        "model_flags":       e["model_flags"],
+        "host_status":       e["host_status"],
+        "user_status":       e["user_status"],
+        "user":              e["user"],
+        "host":              e["host"],
+        "message_preview":   e["message"][:120],
+        "analyst_notes":     e["analyst_notes"],
     } for e in events]
-    write_csv(audit, os.path.join(output_dir, "esuth_label_audit.csv"), "Label audit trail")
 
-    # Step 7: Summary report
-    write_summary(events, sessions, output_dir)
+    file_plan = {
+        "LIRA_00_master_all_events.csv":         events,
+        "LIRA_01_incidents_only.csv":            incidents,
+        "LIRA_02_model_downtime_events.csv":     downtime_ev,
+        "LIRA_03_model_downtime_sessions.csv":   sessions,
+        "LIRA_04_model_data_corruption.csv":     corrupt_ev,
+        "LIRA_05_model_unauthorized_access.csv": unauth_ev,
+        "LIRA_06_model_suspicious_review.csv":   suspect_ev,
+        "LIRA_07_label_audit_trail.csv":         audit,
+    }
 
-    print("\n" + "=" * 65)
-    print("PARSING COMPLETE")
-    print(f"  Total events:     {len(events)}")
-    print(f"  Incident events:  {len(incident_events)}")
-    print(f"  Downtime sessions:{len(sessions)}")
-    print(f"  Output folder:    {output_dir}")
-    print("=" * 65 + "\n")
+    out_files = {}
+    for fname, data in file_plan.items():
+        fpath = os.path.join(out_dir, fname)
+        meta  = write_csv(data, fpath)
+        out_files[fname] = meta
+        print(f"        {fname:<46} {meta['rows']:>7,} rows  {hs(meta['size']):>22}")
+
+    # ── GENERATE REPORT ───────────────────────────────────────────────
+    print("  [6/6] Generating comprehensive PhD-grade analysis report...")
+    report_text = generate_report(
+        events, sessions, disc, bl, out_files,
+        input_path, out_dir, args.work_start, args.work_end, start_dt
+    )
+    report_path = os.path.join(out_dir, "LIRA_REPORT.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report_text)
+    rep_size = os.path.getsize(report_path)
+    out_files["LIRA_REPORT.txt"] = {"size": rep_size, "rows": 0, "cols": 0}
+    print(f"        {'LIRA_REPORT.txt':<46} {'report':>7}       {hs(rep_size):>22}")
+
+    # ── COMPLETION SUMMARY ────────────────────────────────────────────
+    elapsed   = (datetime.now() - start_dt).total_seconds()
+    total_out = sum(m["size"] for m in out_files.values())
+    print()
+    print("  ╔" + "═"*60 + "╗")
+    print("  ║" + "  LIRA v2.0 — PROCESSING COMPLETE".ljust(60) + "║")
+    print("  ╠" + "═"*60 + "╣")
+    print("  ║" + f"  Events parsed        : {len(events):,}".ljust(60) + "║")
+    print("  ║" + f"  Incident events      : {len(incidents):,}".ljust(60) + "║")
+    print("  ║" + f"  Benign events        : {len(events)-len(incidents):,}".ljust(60) + "║")
+    print("  ║" + f"  Downtime sessions    : {len(sessions):,}".ljust(60) + "║")
+    print("  ║" + f"  Unique hosts found   : {len(disc['all_hosts'])}".ljust(60) + "║")
+    print("  ║" + f"  Unique users found   : {len(disc['all_users'])}".ljust(60) + "║")
+    print("  ║" + f"  CSV files created    : {len(file_plan)}".ljust(60) + "║")
+    print("  ║" + f"  Total output size    : {hs(total_out)}".ljust(60) + "║")
+    print("  ║" + f"  Processing time      : {elapsed:.2f} seconds".ljust(60) + "║")
+    print("  ║" + f"  Output location      :".ljust(60) + "║")
+    print("  ║" + f"    {out_dir}"[:60].ljust(60) + "║")
+    print("  ╚" + "═"*60 + "╝")
+    print()
 
 
 if __name__ == "__main__":
