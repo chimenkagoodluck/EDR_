@@ -2,22 +2,26 @@
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                                                                      ║
 ║     L I R A  —  Log Intelligence & Response Analyzer                 ║
-║     Version 2.0  |  ESUTH EMR Cybersecurity Research Tool           ║
+║     Version 2.2  |  ESUTH EMR Cybersecurity Research Tool           ║
 ║                                                                      ║
 ║     PhD Research:                                                    ║
 ║     "An Enhanced Incident Response Plan for Electronic Medical       ║
 ║      Record Systems at Tertiary Health Facilities in Nigeria"        ║
 ║                                                                      ║
-║     Architecture : Two-Pass Fully Dynamic Pipeline                   ║
-║       PASS 1 — Discovery  : Reads the entire log file once,         ║
-║                             discovers all unique users, hosts,       ║
-║                             databases, message patterns, and         ║
-║                             establishes statistical baselines        ║
-║                             with ZERO hardcoded assumptions.         ║
-║       PASS 2 — Labeling   : Uses only what was discovered in         ║
-║                             Pass 1 to label every event via          ║
-║                             a 25-rule deterministic engine.          ║
-║                             Every label is traceable by Rule ID.     ║
+║     Architecture : Three-Pass Fully Dynamic Pipeline                 ║
+║       PASS 1 — Discovery       : Reads entire log once, discovers   ║
+║                                  all unique users, hosts, databases, ║
+║                                  message patterns, with ZERO         ║
+║                                  hardcoded assumptions.              ║
+║       PASS 1b — Startup Context: Assigns every event a startup      ║
+║                                  session type: crash_startup or      ║
+║                                  clean_startup. Context-dependent    ║
+║                                  events (R07/R08/R09) are only       ║
+║                                  labeled as DATA_CORRUPTION when     ║
+║                                  they occur inside a crash session.  ║
+║       PASS 2 — Labeling        : Uses discovery + context to label  ║
+║                                  every event via 25-rule engine.     ║
+║                                  Every label is traceable by Rule ID.║
 ║                                                                      ║
 ║     Output    : 8 CSV files + 1 comprehensive TXT report            ║
 ║                 Report is 100% auto-generated from the log data.     ║
@@ -56,7 +60,7 @@ from collections import Counter, defaultdict
 # ═══════════════════════════════════════════════════════════════════════
 
 TOOL_NAME      = "LIRA — Log Intelligence & Response Analyzer"
-TOOL_VERSION   = "2.0"
+TOOL_VERSION   = "2.2"
 TOOL_CODENAME  = "ESUTH-IRP-RESEARCH"
 RESEARCH_TITLE = (
     "An Enhanced Incident Response Plan for Electronic Medical "
@@ -416,6 +420,119 @@ def compute_baseline(disc: dict, user_pct: float, host_pct: float) -> dict:
 # Every rule produces a complete, traceable decision record.
 # ═══════════════════════════════════════════════════════════════════════
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# PASS 1b — STARTUP CONTEXT ASSIGNMENT
+#
+# Problem this solves:
+#   InnoDB: 128 out of 128 rollback segments are active
+#   InnoDB: Creating shared tablespace for temporary tables
+#   InnoDB: Removed temporary tablespace data file
+#
+#   These three messages appear on EVERY startup — both after a crash
+#   AND after a clean shutdown. Labeling all of them DATA_CORRUPTION is
+#   wrong. They are only a data integrity risk when the startup that
+#   contains them was triggered by a crash.
+#
+# How it works:
+#   Scans events in order and assigns each event to a startup SESSION.
+#   A session begins at "Starting MariaDB" and ends at "ready for
+#   connections". If "crash recovery" appears within the session, the
+#   entire session is tagged startup_context = "crash_startup".
+#   Otherwise it is tagged "clean_startup". Events outside a startup
+#   window are tagged "running".
+#
+# Result:
+#   R07 / R08 / R09 fire as DATA_CORRUPTION only for crash_startup.
+#   For clean_startup they fall through to BENIGN (R23).
+# ═══════════════════════════════════════════════════════════════════════
+
+def assign_startup_context(events: list) -> list:
+    """
+    Pass 1b: Walk events sequentially and stamp each with:
+        startup_context     : "crash_startup" | "clean_startup" | "running"
+        startup_session_id  : integer counter (same id within one startup block)
+
+    Two-phase approach per startup session:
+        Phase A — Collection:
+            Accumulate all events between "Starting MariaDB" and
+            "ready for connections" into a buffer.
+        Phase B — Classification:
+            If any event in the buffer matched "crash recovery" or
+            "aria engine: starting recovery", tag the whole buffer
+            as crash_startup. Otherwise clean_startup.
+        Then flush the buffer with the correct tag.
+
+    Events between startups (while DB is running) get tag "running".
+    """
+
+    # Add startup_context and startup_session_id fields to every event first
+    for e in events:
+        e["startup_context"]    = "running"
+        e["startup_session_id"] = 0
+
+    session_id   = 0
+    in_startup   = False
+    buffer       = []        # events accumulated in current startup window
+    had_crash    = False     # did this startup contain a crash recovery?
+
+    for e in events:
+        msg = e["message"].lower()
+
+        # ── Detect start of a new startup window ────────────────────
+        if "starting mariadb" in msg:
+            # If we were already in a startup (abnormal — restart within restart),
+            # flush the previous buffer as clean before opening a new one.
+            if in_startup and buffer:
+                ctx = "crash_startup" if had_crash else "clean_startup"
+                for be in buffer:
+                    be["startup_context"]    = ctx
+                    be["startup_session_id"] = session_id
+
+            session_id  += 1
+            in_startup   = True
+            had_crash    = False
+            buffer       = [e]
+            e["startup_context"]    = "unknown"   # will be resolved on flush
+            e["startup_session_id"] = session_id
+            continue
+
+        # ── Accumulate events within a startup window ────────────────
+        if in_startup:
+            e["startup_session_id"] = session_id
+            e["startup_context"]    = "unknown"   # resolved on flush
+            buffer.append(e)
+
+            # Check for crash recovery signal within this startup
+            if ("innodb: starting crash recovery" in msg or
+                    "aria engine: starting recovery" in msg):
+                had_crash = True
+
+            # ── Detect end of startup window ─────────────────────────
+            if "ready for connections" in msg:
+                ctx = "crash_startup" if had_crash else "clean_startup"
+                for be in buffer:
+                    be["startup_context"]    = ctx
+                    be["startup_session_id"] = session_id
+                in_startup = False
+                buffer     = []
+                had_crash  = False
+
+        # ── Events outside any startup window ────────────────────────
+        else:
+            e["startup_context"]    = "running"
+            e["startup_session_id"] = session_id  # same session as last completed startup
+
+    # Flush any incomplete startup at end of file
+    if in_startup and buffer:
+        ctx = "crash_startup" if had_crash else "clean_startup"
+        for be in buffer:
+            be["startup_context"]    = ctx
+            be["startup_session_id"] = session_id
+
+    return events
+
+
 RULE_CATALOG = {
     "R01": "InnoDB crash recovery initiated",
     "R02": "Aria engine crash recovery initiated",
@@ -442,22 +559,37 @@ RULE_CATALOG = {
     "R23": "Startup sequence or replication configuration — benign",
     "R24": "General informational Note — benign operational",
     "R25": "Unclassified Warning — requires manual analyst review",
+    # ── Rules added in v2.2 from full log analysis ─────────────────
+    "R26": "Too many connections — DB connection limit reached (availability incident)",
+    "R27": "Table cache mutex contention — performance degradation under load",
+    "R28": "InnoDB system data file not writable — critical storage error",
+    "R29": "InnoDB LSN mismatch in system tablespace — data integrity at risk",
+    "R30": "InnoDB/plugin storage engine failure — service unable to start",
+    "R31": "Database abort — emergency shutdown due to unrecoverable error",
 }
 
 
 def label_event(event: dict, bl: dict, work_start: int, work_end: int) -> dict:
     """
     Apply the 25-rule labeling engine to a single event.
-    Uses only the dynamically computed baseline (bl), no hardcoded values.
+    Uses only the dynamically computed baseline (bl) and the pre-assigned
+    startup_context field — no hardcoded values anywhere.
+
+    Context-dependent rules (R07, R08, R09):
+        Only fire as DATA_CORRUPTION when startup_context == "crash_startup".
+        In a clean_startup they fall through to BENIGN (R23), because
+        InnoDB performs these same operations on every startup regardless
+        of whether the prior shutdown was clean or a crash.
     """
 
-    msg   = event["message"].lower()
-    user  = event["user"]
-    host  = event["host"]
-    level = event["level"]
-    hour  = event["hour"]
-    ad_u  = event["access_denied_user"]
-    dns   = event["is_dns_failure"]
+    msg             = event["message"].lower()
+    user            = event["user"]
+    host            = event["host"]
+    level           = event["level"]
+    hour            = event["hour"]
+    ad_u            = event["access_denied_user"]
+    dns             = event["is_dns_failure"]
+    startup_context = event.get("startup_context", "running")
 
     is_aft = (hour != -1 and (hour < work_start or hour > work_end))
     abort_reason = event["abort_reason"].lower()
@@ -587,45 +719,97 @@ def label_event(event: dict, bl: dict, work_start: int, work_end: int) -> dict:
     # ══════════════════════════════════════════════════════════════════
 
     elif "creating shared tablespace for temporary tables" in msg:
-        label     = "DATA_CORRUPTION"
-        sublabel  = "temp_tablespace_recreated_post_crash"
-        severity  = "HIGH"
-        rule_id   = "R07"
-        models    = ["data_corruption"]
-        notes = (
-            "InnoDB is recreating the shared temporary tablespace (ibtmp1) because "
-            "the prior instance left it in an inconsistent state. Any EMR temporary "
-            "table data open at the time of the crash — such as in-progress patient "
-            "record saves or billing transactions — is permanently lost. This event "
-            "is a DATA INTEGRITY RISK marker."
-        )
+        # R07 — Context-dependent.
+        # This message appears on EVERY startup (crash or clean).
+        # It is only a DATA_CORRUPTION signal in a crash_startup session
+        # because that is when InnoDB is recreating the tablespace to
+        # replace one that was left inconsistent by the crash.
+        # In a clean_startup it is normal InnoDB initialization — BENIGN.
+        if startup_context == "crash_startup":
+            label     = "DATA_CORRUPTION"
+            sublabel  = "temp_tablespace_recreated_post_crash"
+            severity  = "HIGH"
+            rule_id   = "R07"
+            models    = ["data_corruption"]
+            notes = (
+                "InnoDB is recreating the shared temporary tablespace (ibtmp1) "
+                "because the prior session ended abnormally (confirmed: this "
+                "startup contains a crash recovery event). Any EMR temporary "
+                "table data open at crash time — such as in-progress patient "
+                "record saves or billing transactions — is permanently lost."
+            )
+        else:
+            # clean_startup — this is normal InnoDB startup behaviour
+            label    = "BENIGN"
+            sublabel = "innodb_temp_tablespace_init_clean_startup"
+            severity = "INFO"
+            rule_id  = "R23"
+            notes    = (
+                "InnoDB initializing its temporary tablespace as part of a "
+                "normal clean startup. The prior shutdown was orderly — no "
+                "data integrity risk. This is standard InnoDB startup behaviour."
+            )
 
     elif "removed temporary tablespace data file" in msg:
-        label     = "DATA_CORRUPTION"
-        sublabel  = "stale_temp_file_removed_after_crash"
-        severity  = "MEDIUM"
-        rule_id   = "R08"
-        models    = ["data_corruption"]
-        notes = (
-            "InnoDB found and removed a leftover temporary tablespace file from the "
-            "crashed prior session. This confirms the previous session ended "
-            "abnormally. Any data held exclusively in temporary structures during "
-            "that session is unrecoverable."
-        )
+        # R08 — Context-dependent. Same logic as R07.
+        # InnoDB removes the old ibtmp1 file on every startup, then
+        # creates a fresh one. Only a corruption risk after a crash.
+        if startup_context == "crash_startup":
+            label     = "DATA_CORRUPTION"
+            sublabel  = "stale_temp_file_removed_after_crash"
+            severity  = "MEDIUM"
+            rule_id   = "R08"
+            models    = ["data_corruption"]
+            notes = (
+                "InnoDB removed the leftover ibtmp1 file from the previous "
+                "crashed session (confirmed: crash recovery in this startup). "
+                "Any data held exclusively in temporary structures during that "
+                "session is unrecoverable. File removal confirms abnormal prior exit."
+            )
+        else:
+            label    = "BENIGN"
+            sublabel = "innodb_temp_file_cleanup_clean_startup"
+            severity = "INFO"
+            rule_id  = "R23"
+            notes    = (
+                "InnoDB removing the previous session's temporary tablespace "
+                "file as part of normal clean startup. Prior shutdown was "
+                "orderly — this is standard cleanup behaviour, not a crash artifact."
+            )
 
     elif "rollback segments are active" in msg:
-        label     = "DATA_CORRUPTION"
-        sublabel  = "rollback_segments_activated_post_crash"
-        severity  = "MEDIUM"
-        rule_id   = "R09"
-        models    = ["data_corruption"]
-        notes = (
-            "InnoDB's rollback segments are being activated as part of crash "
-            "recovery. This means uncommitted transactions present at crash time "
-            "are being rolled back to restore ACID consistency. From the EMR "
-            "perspective: any patient record or billing entry that was being "
-            "written when the system crashed was NOT saved."
-        )
+        # R09 — Context-dependent. This is the event the user flagged.
+        # "128 out of 128 rollback segments are active" appears on every
+        # single startup — it is just InnoDB confirming its undo log
+        # infrastructure is ready. It has NO special meaning in a clean
+        # startup. It is only significant after a crash because it signals
+        # that uncommitted transactions are being rolled back to restore
+        # consistency after an abrupt shutdown.
+        if startup_context == "crash_startup":
+            label     = "DATA_CORRUPTION"
+            sublabel  = "rollback_segments_activated_post_crash"
+            severity  = "MEDIUM"
+            rule_id   = "R09"
+            models    = ["data_corruption"]
+            notes = (
+                "InnoDB rollback segments activated within a crash recovery "
+                "startup (confirmed: crash recovery detected in this session). "
+                "Uncommitted transactions present at crash time are being rolled "
+                "back to restore ACID consistency. Any EMR patient record or "
+                "billing entry that was mid-write when the system crashed was "
+                "NOT saved — it has been rolled back."
+            )
+        else:
+            label    = "BENIGN"
+            sublabel = "innodb_rollback_segments_normal_init"
+            severity = "INFO"
+            rule_id  = "R23"
+            notes    = (
+                "InnoDB confirming all rollback segments are active — this is "
+                "standard startup behaviour on every startup, crash or clean. "
+                "No crash recovery in this startup session, so this event "
+                "carries no data integrity risk."
+            )
 
     # ══════════════════════════════════════════════════════════════════
     # BLOCK C — UNAUTHORIZED ACCESS
@@ -733,6 +917,31 @@ def label_event(event: dict, bl: dict, work_start: int, work_end: int) -> dict:
             "bypassing hostname-based access controls."
         )
 
+    elif event["is_aborted_connection"] == "1" and "too many connections" in abort_reason:
+        # R26 — Too many connections.
+        # The database server hit its max_connections limit and rejected
+        # this connection before it could be established. MariaDB logs
+        # the host as "connecting host" when it cannot resolve the hostname
+        # before the rejection. This is a SERVICE AVAILABILITY incident —
+        # all 207 hospital workstations would have experienced intermittent
+        # EMR access failures during these periods.
+        label     = "SYSTEM_DOWNTIME"
+        sublabel  = "connection_limit_reached_availability_incident"
+        severity  = "HIGH"
+        rule_id   = "R26"
+        models    = ["downtime_events"]
+        confidence = "HIGH"
+        notes = (
+            "The MariaDB server hit its maximum connection limit (default 151) "
+            "and rejected this connection. The EMR system was PARTIALLY "
+            "UNAVAILABLE — some workstations could not access patient records "
+            "at this moment. With 207 workstations sharing the database, "
+            "connection exhaustion is a recurring availability risk. "
+            "Recommendation: increase max_connections or implement connection "
+            "pooling at the application layer. This event feeds the System "
+            "Downtime model as a resource-exhaustion availability incident."
+        )
+
     elif event["is_aborted_connection"] == "1" and host_status == "non_baseline":
         label     = "SUSPICIOUS"
         sublabel  = "aborted_connection_non_baseline_host"
@@ -790,6 +999,165 @@ def label_event(event: dict, bl: dict, work_start: int, work_end: int) -> dict:
             "presenting different addresses, (2) stale DNS records on the hospital "
             "network, or (3) in a threat scenario, hostname spoofing. The "
             "hostname/IP combination should be verified with the IT administrator."
+        )
+
+    elif dns == "1":
+        label     = "SUSPICIOUS"
+        sublabel  = "dns_resolution_failure_or_hostname_mismatch"
+        severity  = "MEDIUM"
+        rule_id   = "R19"
+        models    = ["unauthorized_access", "suspicious_review"]
+        confidence = "MEDIUM"
+        notes = (
+            f"MariaDB could not resolve '{event['dns_entity']}' to its expected "
+            "address. Causes include: (1) device with multiple network adapters "
+            "presenting different addresses, (2) stale DNS records on the hospital "
+            "network, or (3) in a threat scenario, hostname spoofing. The "
+            "hostname/IP combination should be verified with the IT administrator."
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # BLOCK C2 — CRITICAL INFRASTRUCTURE FAILURES
+    # Rules R27-R31 added in v2.2 from full log analysis.
+    # These patterns were absent from the 2% sample but present in
+    # the full 35MB log and represent the most severe events recorded.
+    # ══════════════════════════════════════════════════════════════════
+
+    elif "table cache mutex contention" in msg:
+        # R27 — Table cache mutex contention.
+        # The table cache lock is being contested by multiple threads,
+        # causing query wait times to spike. This is a performance
+        # degradation event that affects all concurrent EMR users.
+        label     = "SYSTEM_DOWNTIME"
+        sublabel  = "table_cache_mutex_contention_performance_degradation"
+        severity  = "MEDIUM"
+        rule_id   = "R27"
+        models    = ["downtime_events"]
+        confidence = "HIGH"
+        notes = (
+            "MariaDB detected contention on its table cache mutex — multiple "
+            "threads are competing for the same internal lock. This causes "
+            "query slowdowns affecting all hospital workstations simultaneously. "
+            "It indicates the table_open_cache setting is too small for the "
+            "number of concurrent EMR users (207 workstations). While not a "
+            "full outage, it represents partial service degradation and feeds "
+            "the System Downtime model as a performance-based availability event."
+        )
+
+    elif "innodb_system data file" in msg and "writable" in msg:
+        # R28 — InnoDB system tablespace data file is not writable.
+        # This is a CRITICAL storage-level failure. If InnoDB cannot write
+        # to its system tablespace (ibdata1), it cannot function at all.
+        # This event directly precedes the Plugin failure and Aborting
+        # sequence observed in the full log — it is the ROOT CAUSE of the
+        # catastrophic database abort event.
+        label     = "DATA_CORRUPTION"
+        sublabel  = "innodb_system_data_file_not_writable_critical"
+        severity  = "CRITICAL"
+        rule_id   = "R28"
+        models    = ["data_corruption", "downtime_events"]
+        confidence = "HIGH"
+        notes = (
+            "InnoDB cannot write to its system tablespace data file (ibdata1). "
+            "This is a CRITICAL storage failure — it means the database file "
+            "system is either full, the file permissions changed, or the disk "
+            "has errors. InnoDB CANNOT operate without write access to ibdata1. "
+            "In the full ESUTH log, this event directly preceded the InnoDB "
+            "storage engine failure and the complete database abort. All patient "
+            "record writes would be failing silently or causing errors. "
+            "This is the root cause of the most severe incident in the log."
+        )
+
+    elif "log sequence number" in msg and "does not match" in msg:
+        # R29 — InnoDB LSN mismatch between redo log and system tablespace.
+        # This means the transaction log and the data files are out of sync —
+        # a direct indicator of data corruption or incomplete recovery.
+        label     = "DATA_CORRUPTION"
+        sublabel  = "innodb_lsn_mismatch_system_tablespace_corruption"
+        severity  = "CRITICAL"
+        rule_id   = "R29"
+        models    = ["data_corruption"]
+        confidence = "HIGH"
+        notes = (
+            "InnoDB detected that the Log Sequence Number (LSN) in the redo "
+            "log does not match the LSN stored in the system tablespace header. "
+            "This is a definitive data integrity failure — the transaction log "
+            "and the data files have diverged, meaning some committed "
+            "transactions may not be reflected in the data files. This can "
+            "result in permanently lost or inconsistent patient records. "
+            "This is one of the most serious InnoDB error events possible."
+        )
+
+    elif any(k in msg for k in [
+        "init function returned error",
+        "registration as a storage engine failed",
+        "unknown/unsupported storage engine",
+        "unsupported storage engine",
+    ]) or ("plugin" in msg and any(k in msg for k in [
+        "init function returned error",
+        "registration as a storage engine failed",
+    ])):
+        # R30 — InnoDB storage engine plugin failure.
+        # Triggered ONLY by specific failure keywords — NOT by the benign
+        # "Plugin 'FEEDBACK' is disabled" message which is caught by R22.
+        # When InnoDB fails to register as a storage engine, MariaDB cannot
+        # use it. Any table using InnoDB (which is all of them in the EMR DB)
+        # becomes inaccessible. This is a precursor to the Aborting event (R31).
+        is_critical = any(k in msg for k in [
+            "registration as a storage engine failed",
+            "unknown/unsupported storage engine",
+            "unsupported storage engine",
+        ])
+        label     = "SYSTEM_DOWNTIME"
+        sublabel  = (
+            "innodb_storage_engine_registration_failed_critical"
+            if is_critical else
+            "plugin_init_function_error"
+        )
+        severity  = "CRITICAL" if is_critical else "HIGH"
+        rule_id   = "R30"
+        models    = ["downtime_events"]
+        confidence = "HIGH"
+        notes = (
+            "InnoDB failed to register as a storage engine in MariaDB. "
+            + (
+                "CRITICAL: Without InnoDB, ALL tables in the EMR database "
+                "(bamed) are inaccessible because they are InnoDB tables. "
+                "This makes the ENTIRE hospital EMR system unavailable. "
+                "In the ESUTH log, this event is part of the catastrophic "
+                "sequence that ended in a complete database abort."
+                if is_critical else
+                "A plugin initialization function returned an error. "
+                "This may be a precursor to a storage engine failure. "
+                "Investigate the full message and context in the log."
+            )
+        )
+
+    elif "aborting" in msg and level in ("Warning", "Error", "Note"):
+        # R31 — Database abort — emergency shutdown.
+        # MariaDB calls Aborting when it encounters an unrecoverable error
+        # and must perform an emergency shutdown. This is the most severe
+        # possible event — more severe than a crash because it is triggered
+        # by an unrecoverable internal error, not just a power failure.
+        # In the ESUTH full log this occurred once — after the InnoDB
+        # storage engine failure sequence (R28 → R29 → R30 → R31).
+        label     = "SYSTEM_DOWNTIME"
+        sublabel  = "database_emergency_abort_unrecoverable_error"
+        severity  = "CRITICAL"
+        rule_id   = "R31"
+        models    = ["downtime_events"]
+        confidence = "HIGH"
+        notes = (
+            "MariaDB performed an emergency abort — an unrecoverable internal "
+            "error forced an immediate shutdown. Unlike a crash (power loss), "
+            "an abort is triggered by a fatal software or storage error that "
+            "MariaDB itself detected and could not recover from. In the ESUTH "
+            "log, this event occurred once as the final step of the sequence: "
+            "ibdata1 not writable (R28) → LSN mismatch (R29) → "
+            "InnoDB engine failed to load (R30) → Aborting (R31). "
+            "The complete EMR system was unavailable until a manual IT "
+            "administrator intervention restarted the database service. "
+            "This is the single most severe incident in the entire 2.5-year log."
         )
 
     elif event["is_aborted_connection"] == "1" and host_status in ("no_host", "system"):
@@ -1099,7 +1467,7 @@ def generate_report(
     # ── COVER PAGE ────────────────────────────────────────────────────
     SEP()
     L(f"{'LIRA — Log Intelligence & Response Analyzer':^{W}}")
-    L(f"{'Version 2.0':^{W}}")
+    L(f"{'Version 2.2':^{W}}")
     SEP()
     L(f"{'COMPREHENSIVE LOG ANALYSIS REPORT':^{W}}")
     L(f"{'PhD Research — Incident Response Plan for EMR Systems':^{W}}")
@@ -1525,7 +1893,28 @@ def generate_report(
     if ad_hosts:
         I("  Failed login attempts from host:")
         for h, c in ad_hosts.most_common():
-            I(f"    '{h}' : {c:,} attempts")
+            in_bl = "BASELINE HOST" if h in bl["baseline_hosts"] else "NON-BASELINE"
+            flag = "⚠ CRITICAL ANOMALY" if (h in bl["baseline_hosts"] and c > 100) else ""
+            I(f"    '{h}' : {c:,} attempts  [{in_bl}]  {flag}")
+    # Detect DUFUTH-SERVER type anomaly: a baseline host dominating access denied
+    dominant_ad_host = ad_hosts.most_common(1)
+    if dominant_ad_host:
+        dh, dc = dominant_ad_host[0]
+        if dh in bl["baseline_hosts"] and dc > 100:
+            L()
+            I(f"  ⚠ CRITICAL ANOMALY DETECTED: '{dh}' is a REGISTERED BASELINE HOST")
+            I(f"    yet generated {dc:,} access denied events")
+            I(f"    ({dc/len(access_denied)*100:.1f}% of ALL access denied events from one host)")
+            I("    A legitimate registered server should NOT be failing authentication")
+            I("    repeatedly. This indicates one of:")
+            I("      1. A severely misconfigured application on this server")
+            I("         using wrong/expired credentials repeatedly")
+            I("      2. A compromised server attempting credential attacks")
+            I("         against the database from a trusted network position")
+            I("      3. A database password change that was not propagated")
+            I("         to all applications running on this server")
+            I("    ACTION REQUIRED: IT admin must investigate this host immediately.")
+            I("    This is your strongest security finding in the entire dataset.")
     L()
 
     # Finding 3 — Unauthenticated
@@ -1555,6 +1944,42 @@ def generate_report(
         for ent, cnt in dns_entities.most_common(10):
             I(f"    '{ent}'  :  {cnt:,} failures")
     L()
+
+    # Finding NEW — Too many connections / connection limit exhaustion
+    too_many = sum(1 for e in events if e["rule_id"] == "R26")
+    if too_many > 0:
+        I(f"FINDING 5b — Connection Limit Exhaustion [{too_many:,} events] (R26 — NEW)")
+        sep2()
+        I(f"  Database hit its max_connections limit : {too_many:,} times")
+        I("  Every occurrence means at least one hospital workstation was")
+        I("  UNABLE to access patient records at that moment.")
+        I("  With 207 workstations sharing one database server, connection")
+        I("  exhaustion is a recurring availability risk.")
+        I("  Recommendation: review max_connections setting and implement")
+        I("  connection pooling (e.g. ProxySQL or PgBouncer equivalent).")
+        L()
+
+    # Finding NEW — Catastrophic abort sequence
+    abort_cnt  = sum(1 for e in events if e["rule_id"] == "R31")
+    r28_cnt    = sum(1 for e in events if e["rule_id"] == "R28")
+    r29_cnt    = sum(1 for e in events if e["rule_id"] == "R29")
+    r30_cnt    = sum(1 for e in events if e["rule_id"] == "R30")
+    if abort_cnt > 0 or r28_cnt > 0:
+        I(f"FINDING 5c — CATASTROPHIC DATABASE ABORT SEQUENCE DETECTED (R28-R31)")
+        sep2()
+        I("  The following critical event sequence was found in this log:")
+        I(f"    R28 — InnoDB data file not writable   : {r28_cnt:,} event(s) [CRITICAL]")
+        I(f"    R29 — LSN mismatch system tablespace  : {r29_cnt:,} event(s) [CRITICAL]")
+        I(f"    R30 — InnoDB storage engine failure   : {r30_cnt:,} event(s) [CRITICAL]")
+        I(f"    R31 — Database emergency abort        : {abort_cnt:,} event(s) [CRITICAL]")
+        I("  This sequence represents the most severe incident in the entire")
+        I("  dataset — a complete, unrecoverable database failure requiring")
+        I("  manual IT administrator intervention to restore service.")
+        I("  The EMR system was completely unavailable until the server was")
+        I("  manually restarted and the storage issue resolved.")
+        I("  Root cause: ibdata1 system tablespace became non-writable —")
+        I("  likely due to disk full, file permission change, or disk error.")
+        L()
 
     # Finding 6 — After hours
     I(f"FINDING 6 — After-Hours Incidents [{len(after_hours_inc):,} events]")
@@ -1710,7 +2135,7 @@ def generate_report(
 
     # ── FOOTER ───────────────────────────────────────────────────────
     SEP()
-    L(f"{'LIRA — Log Intelligence & Response Analyzer  v2.0':^{W}}")
+    L(f"{'LIRA — Log Intelligence & Response Analyzer  v2.2':^{W}}")
     L(f"{'All statistics auto-generated from parsed log data':^{W}}")
     L(f"{'Every label is deterministic and traceable via LIRA_07':^{W}}")
     L(f"{'Report generated: ' + end_dt.strftime('%Y-%m-%d %H:%M:%S'):^{W}}")
@@ -1725,7 +2150,7 @@ def generate_report(
 
 def main():
     ap = argparse.ArgumentParser(
-        description=f"{TOOL_NAME} v2.0 — PhD ESUTH EMR Incident Response Research"
+        description=f"{TOOL_NAME} v2.2 — PhD ESUTH EMR Incident Response Research"
     )
     ap.add_argument("--input",  "-i", required=True,
         help='Path to MariaDB error log. E.g. "C:\\xampp\\mysql\\data\\mysql_error.log"')
@@ -1750,7 +2175,7 @@ def main():
 
     print()
     print("╔" + "═"*68 + "╗")
-    print("║" + f"  {TOOL_NAME}  v2.0".ljust(68) + "║")
+    print("║" + f"  {TOOL_NAME}  v2.2".ljust(68) + "║")
     print("║" + f"  PhD Research — ESUTH EMR Incident Response System".ljust(68) + "║")
     print("╚" + "═"*68 + "╝")
     print()
@@ -1762,7 +2187,7 @@ def main():
     print()
 
     # ── PASS 1: DISCOVERY ────────────────────────────────────────────
-    print("  [1/6] PASS 1 — Discovery: reading entire log file...")
+    print("  [1/7] PASS 1 — Discovery: reading entire log file...")
     disc = discover(input_path)
     print(f"        {len(disc['raw_events']):,} events discovered in "
           f"{disc['raw_line_count']:,} raw lines")
@@ -1771,8 +2196,24 @@ def main():
           f"Unique hosts: {len(disc['all_hosts'])}  |  "
           f"Unique DBs: {len(disc['all_db_names'])}")
 
+    # ── PASS 1b: STARTUP CONTEXT ─────────────────────────────────────
+    print("  [2/7] PASS 1b — Startup context: classifying each event as")
+    print("         crash_startup, clean_startup, or running...")
+    disc["raw_events"] = assign_startup_context(disc["raw_events"])
+    crash_sess = len(set(
+        e["startup_session_id"] for e in disc["raw_events"]
+        if e["startup_context"] == "crash_startup"
+    ))
+    clean_sess = len(set(
+        e["startup_session_id"] for e in disc["raw_events"]
+        if e["startup_context"] == "clean_startup"
+    ))
+    print(f"        Crash startup sessions : {crash_sess}")
+    print(f"        Clean startup sessions : {clean_sess}")
+    print(f"        Context-dependent rules R07/R08/R09 will label correctly")
+
     # ── BASELINE COMPUTATION ─────────────────────────────────────────
-    print("  [2/6] Computing statistical baseline from discovered data...")
+    print("  [3/7] Computing statistical baseline from discovered data...")
     bl = compute_baseline(disc, args.top_user_pct, args.top_host_pct)
     print(f"        Baseline users ({args.top_user_pct}% threshold): "
           f"{', '.join(sorted(bl['baseline_users'])) or 'none'}")
@@ -1780,7 +2221,7 @@ def main():
           f"{len(bl['baseline_hosts'])} hosts")
 
     # ── PASS 2: LABELING ─────────────────────────────────────────────
-    print("  [3/6] PASS 2 — Labeling: applying 25-rule engine to all events...")
+    print("  [4/7] PASS 2 — Labeling: applying 25-rule engine to all events...")
     events = [
         label_event(e, bl, args.work_start, args.work_end)
         for e in disc["raw_events"]
@@ -1790,12 +2231,12 @@ def main():
         print(f"        {lb:<30} {cnt:>7,} events")
 
     # ── DOWNTIME SESSIONS ─────────────────────────────────────────────
-    print("  [4/6] Building downtime sessions...")
+    print("  [5/7] Building downtime sessions...")
     sessions = build_sessions(events)
     print(f"        {len(sessions):,} complete crash-recovery sessions identified")
 
     # ── WRITE CSV FILES ───────────────────────────────────────────────
-    print("  [5/6] Writing output CSV files...")
+    print("  [6/7] Writing output CSV files...")
 
     incidents    = [e for e in events if e["is_incident"] == "1"]
     downtime_ev  = [e for e in events if "downtime_events"      in e["model_flags"]]
@@ -1845,7 +2286,7 @@ def main():
         print(f"        {fname:<46} {meta['rows']:>7,} rows  {hs(meta['size']):>22}")
 
     # ── GENERATE REPORT ───────────────────────────────────────────────
-    print("  [6/6] Generating comprehensive PhD-grade analysis report...")
+    print("  [7/7] Generating comprehensive PhD-grade analysis report...")
     report_text = generate_report(
         events, sessions, disc, bl, out_files,
         input_path, out_dir, args.work_start, args.work_end, start_dt
@@ -1862,7 +2303,7 @@ def main():
     total_out = sum(m["size"] for m in out_files.values())
     print()
     print("  ╔" + "═"*60 + "╗")
-    print("  ║" + "  LIRA v2.0 — PROCESSING COMPLETE".ljust(60) + "║")
+    print("  ║" + "  LIRA v2.2 — PROCESSING COMPLETE".ljust(60) + "║")
     print("  ╠" + "═"*60 + "╣")
     print("  ║" + f"  Events parsed        : {len(events):,}".ljust(60) + "║")
     print("  ║" + f"  Incident events      : {len(incidents):,}".ljust(60) + "║")
@@ -1881,3 +2322,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

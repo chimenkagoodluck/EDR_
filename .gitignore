@@ -1,0 +1,15 @@
+*.csv
+*.docx
+*.txt
+*.log
+*.pdf
+*.xlsx
+*.json
+*.xml
+*.evtx
+Logs/
+Stuctured/
+venv/
+__pycache__/
+generate_architecture_docx.py
+systems
