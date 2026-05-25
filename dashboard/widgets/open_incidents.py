@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QItemSelectionModel
 from PyQt6.QtGui import QColor, QBrush, QGuiApplication
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
@@ -177,18 +177,29 @@ class OpenIncidentsWidget(QWidget):
             self.bus.status_message.emit(f"DB read failed: {exc}", 4000)
             return
 
-        # preserve current selection
-        keep = self._selected_incident_id()
+        # Preserve the FULL selection (not just one row) -- otherwise a
+        # multi-select collapses to a single row on the next refresh tick.
+        keep_ids = set(self._selected_incident_ids())
 
+        self.tbl.blockSignals(True)
         self.tbl.setUpdatesEnabled(False)
         try:
             self.tbl.setRowCount(len(incidents))
+            keep_rows: List[int] = []
             for r, inc in enumerate(incidents):
                 self._populate_row(r, inc)
-                if keep and inc.incident_id == keep:
-                    self.tbl.selectRow(r)
+                if inc.incident_id in keep_ids:
+                    keep_rows.append(r)
+            sm = self.tbl.selectionModel()
+            sm.clearSelection()
+            for r in keep_rows:
+                sm.select(
+                    self.tbl.model().index(r, 0),
+                    QItemSelectionModel.SelectionFlag.Select
+                    | QItemSelectionModel.SelectionFlag.Rows)
         finally:
             self.tbl.setUpdatesEnabled(True)
+            self.tbl.blockSignals(False)
         # Show total incidents matching the same filters so the admin
         # knows the table is windowed (200 most recent). Cheap COUNT(*)
         # query -- idx_inc_status / idx_inc_type cover it.
