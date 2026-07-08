@@ -1,57 +1,3 @@
-#!/usr/bin/env python3
-"""
-================================================================================
-response/case_store.py
-EIRP-EMR  |  Tier 3  |  Case Management Store (SQLite)
-================================================================================
-
-PURPOSE
--------
-Persistence layer for the Tier-3 incident response engine. Implements the
-5-table schema from the EIRP-EMR architecture doc Section E3 using stdlib
-sqlite3 (no SQLAlchemy dependency).
-
-TABLES
-------
-  incidents              one row per detected incident
-  playbook_execution     one row per playbook step executed
-  evidence_chain         forensic-artefact references (SHA-256 hashed)
-  audit_trail            immutable audit log of every action
-  notifications_log      record of every email / SMS / dashboard alert
-
-PUBLIC API
-----------
-    store = CaseStore("eirp_cases.db")
-    store.init_schema()
-
-    inc_id = store.create_incident(...)
-    store.update_incident_status(inc_id, "CONTAINED")
-    store.add_evidence(inc_id, source_type, file_hash, file_path)
-    store.log_audit(inc_id, action, performed_by, ip_address, change_summary)
-    store.log_notification(inc_id, channel, recipient, delivery_status)
-    store.log_playbook_step(inc_id, step_id, executed_by, outcome,
-                             deadline_met, notes)
-
-    open_cases = store.list_open_incidents()
-    inc        = store.get_incident(inc_id)
-    timeline   = store.get_incident_timeline(inc_id)
-
-THESIS NOTE
------------
-Stdlib sqlite3 was chosen over SQLAlchemy for two reasons:
-  1. Zero additional dependency at deployment (Nigerian hospital IT
-     environments commonly have constrained venv update privileges).
-  2. The 5-table schema is small enough that ORM mapping adds more
-     complexity than it removes.
-Future migration to SQLAlchemy is a one-shot refactor; the table
-definitions in this module's DDL are intentionally compatible with
-sqlalchemy.Column declarations.
-
-RESEARCH CITATION
------------------
-Alozie, O. C. (2023-2026). EIRP-EMR. EBSU/PG/PhD/2023/11861.
-================================================================================
-"""
 from __future__ import annotations
 
 import sqlite3
@@ -65,73 +11,38 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = BASE_DIR / "eirp_cases.db"
 
 
-# ---------------------------------------------------------------------------
 @dataclass
 class Incident:
     incident_id:       str
     incident_type:     str
-    detected_at:       str          # ISO-8601 string
+    detected_at:       str          
     its_score:         float
-    severity:          str          # LOW / MEDIUM / HIGH / CRITICAL
+    severity:          str         
     attack_tactic:     str
     attack_technique:  str
-    status:            str          # OPEN / CONTAINED / CLOSED / ABANDONED
+    status:            str          
     assigned_to:       str
     playbook_id:       str
     summary:           str          = ""
     closed_at:         Optional[str] = None
-    # Source attribution -- which log produced this incident.
-    # source_kind = inference source arg ("lira", "access", "evtx", "error")
-    # source_name = user-friendly name from the dashboard's SourceRegistry
-    #               (e.g. "LIRA 2026") OR blank when persisted from a one-shot
-    #               CLI ml_inference run.
-    # source_path = the actual file/dir that was scanned for this incident.
+   
     source_kind:       str          = ""
     source_name:       str          = ""
     source_path:       str          = ""
-    # source_csv_path = the EXACT parser-output CSV that was scored to
-    # produce this incident (e.g. LIRA_dispatch/2026_log_031214/..master..csv).
-    # source_path above is the user-facing origin (the raw .txt/.evtx); this
-    # pins the precise dispatch CSV so the detail view reads the right row
-    # instead of re-discovering a stale sibling run. Empty for incidents
-    # persisted before this column existed -- the detail view then falls back
-    # to hash-validated discovery.
+
     source_csv_path:   str          = ""
-    # Traceability -- pin the incident to the EXACT event that produced it.
-    # source_row_index   = positional row in the parser-output CSV (0-based).
-    # source_event_hash  = sha1 of canonical event fields (or the parser's
-    #                       own `fingerprint` column for LIRA). Survives
-    #                       parser re-runs that preserve event identity.
-    # supervised_model_id= which of the 7 supervised models produced the
-    #                       winning verdict for this row (0 = none).
+  
     source_row_index:    int          = -1
     source_event_hash:   str          = ""
     supervised_model_id: int          = 0
-    # Dedup attribution -- when the same (source_host, incident_type,
-    # attack_technique) recurs on an OPEN incident, we MERGE into the
-    # existing row instead of creating duplicates:
-    #   source_host       -- host/IP/computer name extracted from the event row
-    #   dedup_key         -- sha1(host|type|technique)[:16]; empty when host
-    #                          is unknown (each unknown-host event stays unique)
-    #   occurrence_count  -- 1 for fresh incidents; incremented on each merge
-    #   first_seen_at     -- detected_at of the first event in this incident
-    #   last_seen_at      -- detected_at of the most recent merged event
-    #   base_its          -- ITS of the first event; its_score is the
-    #                          escalated value (base + log10(count)*0.05,
-    #                          capped at 1.0). Keeping base separate so a
-    #                          recount can be replayed deterministically.
+ 
     source_host:         str          = ""
     dedup_key:           str          = ""
     occurrence_count:    int          = 1
     first_seen_at:       str          = ""
     last_seen_at:        str          = ""
     base_its:            float        = 0.0
-    # AI-vs-Rule dual verdict (see incident_classifier.IncidentDecision).
-    # detection_driver  = "AI" | "RULE" -- which verdict set the persisted
-    #                     type/severity/score above.
-    # verdict_agreement = AGREE | DISAGREE | AI_ONLY | RULE_ONLY
-    # ai_* / rule_*     = each detector's standalone verdict, recorded for the
-    #                     dashboard + thesis compare-and-contrast.
+  
     detection_driver:    str          = ""
     verdict_agreement:   str          = ""
     ai_incident_type:    str          = ""
@@ -148,11 +59,6 @@ class Incident:
         return asdict(self)
 
 
-# ---------------------------------------------------------------------------
-# ITS-driven severity bands. The merge path re-derives severity from the
-# ESCALATED its_score so a MEDIUM that recurs 300 times naturally climbs
-# into HIGH/CRITICAL. Bands kept conservative to match the SOC convention
-# used elsewhere in the dashboard's Open Incidents filter.
 _SEVERITY_BANDS = (
     (0.85, "CRITICAL"),
     (0.65, "HIGH"),
@@ -168,21 +74,13 @@ def _severity_from_its(its: float) -> str:
     return "LOW"
 
 
-# Cap the per-incident forensic ledger (incident_occurrences). A high-volume
-# EVTX scan can merge tens of thousands of events into one OPEN incident; the
-# incident's occurrence_count stays exact, but we stop persisting individual
-# occurrence rows past this cap so the table (and the audit trail) don't grow
-# without bound. The first N raw events are kept as a representative sample.
+
 _MAX_OCCURRENCES_PER_INCIDENT = 200
 
 
 def _compute_dedup_key(source_host: str, incident_type: str,
                        attack_technique: str) -> str:
-    """Hash (host, type, technique) into a 16-char dedup key. Returns ''
-    when host is empty -- caller should then skip the merge lookup and
-    treat each event as a unique incident. Without a known host, merging
-    by (type, technique) alone would collapse genuine independent
-    incidents on different machines into one row."""
+
     if not source_host or not source_host.strip():
         return ""
     raw = f"{source_host.strip().casefold()}|{incident_type}|{attack_technique}"
@@ -190,22 +88,13 @@ def _compute_dedup_key(source_host: str, incident_type: str,
 
 
 def _escalated_its(base_its: float, occurrence_count: int) -> float:
-    """Escalate ITS as occurrences accumulate.
-        effective = min(1.0, base + log10(count) * 0.05)
-    Count=1   -> base
-    Count=10  -> base + 0.05
-    Count=100 -> base + 0.10
-    Count=1000-> base + 0.15  (so a 1000-event burst on a MEDIUM=0.45
-                                  climbs to 0.60, into HIGH territory).
-    Keeps the original signal (base_its) while making volume visible in
-    severity."""
+   
     import math as _m
     if occurrence_count <= 1:
         return float(base_its)
     return min(1.0, float(base_its) + _m.log10(int(occurrence_count)) * 0.05)
 
 
-# ---------------------------------------------------------------------------
 DDL = """
 CREATE TABLE IF NOT EXISTS incidents (
     incident_id       TEXT PRIMARY KEY,
@@ -246,11 +135,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     rule_id           TEXT DEFAULT ''
 );
 
--- One row per raw event behind an incident. When a new event merges into
--- an existing OPEN incident via (source_host, incident_type, attack_technique),
--- the incident's occurrence_count gets bumped and a new occurrence row
--- preserves the forensic detail. The incident table stays compact; the
--- ledger lives here.
+
 CREATE TABLE IF NOT EXISTS incident_occurrences (
     occ_id            INTEGER PRIMARY KEY AUTOINCREMENT,
     incident_id       TEXT NOT NULL,
@@ -333,40 +218,25 @@ CREATE INDEX IF NOT EXISTS idx_occ_observed    ON incident_occurrences(observed_
 """
 
 
-# ---------------------------------------------------------------------------
-class CaseStore:
-    """SQLite-backed persistence for incidents and their lifecycle artefacts."""
 
+class CaseStore:
+  
     def __init__(self, db_path: Path = DEFAULT_DB_PATH):
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
-        # Monotonic write watermark. Dashboard widgets cache their
-        # last-seen value and skip refreshing when it hasn't changed,
-        # turning idle ticks into 1-attribute-access no-ops.
+       
         self.data_version: int = 0
 
-    # ------------------------------------------------------------------
-    # Connection management
-    # ------------------------------------------------------------------
+  
     def connect(self) -> sqlite3.Connection:
         if self._conn is None:
-            # check_same_thread=False: the worker-pool daemon uses a
-            # ThreadingHTTPServer, so /score POSTs come in on per-request
-            # threads while the connection is opened on the engine-load
-            # thread. Without this flag every persist raises
-            # "SQLite objects created in a thread can only be used in
-            # that same thread" and incident counts silently stick at 0.
-            # Safe because ml_inference_daemon._score_one serialises all
-            # writes behind a global lock; no concurrent access can occur.
+           
             self._conn = sqlite3.connect(str(self.db_path),
                                          isolation_level=None,
                                          check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys = ON")
-            # WAL mode enables safe concurrent writers across processes,
-            # required when the dashboard's worker_pool spawns multiple
-            # ml_inference_daemon subprocesses that all write incidents
-            # to the same case-store file.
+          
             try:
                 self._conn.execute("PRAGMA journal_mode = WAL")
                 self._conn.execute("PRAGMA synchronous = NORMAL")
@@ -383,9 +253,7 @@ class CaseStore:
     def init_schema(self) -> None:
         conn = self.connect()
         conn.executescript(DDL)
-        # Backwards-compatible migration: case-store DBs created before the
-        # source-attribution feature lack source_* columns. SQLite has no
-        # `ADD COLUMN IF NOT EXISTS`, so we check + ALTER one-by-one.
+        
         existing = {r[1] for r in conn.execute(
             "PRAGMA table_info(incidents)").fetchall()}
         for col, ddl in [
@@ -419,13 +287,11 @@ class CaseStore:
                     conn.execute(ddl)
                 except sqlite3.OperationalError:
                     pass        # column already exists in a parallel writer
-        # Backfill base_its = its_score for pre-existing rows so the merge
-        # path's escalation math works on legacy incidents. Idempotent --
-        # only touches rows where base_its is still the default 0.0.
+      
         try:
             conn.execute("UPDATE incidents SET base_its = its_score "
                          "WHERE base_its = 0.0 AND its_score > 0.0")
-            # first_seen / last_seen default to detected_at for legacy rows
+
             conn.execute("UPDATE incidents SET first_seen_at = detected_at "
                          "WHERE first_seen_at IS NULL OR first_seen_at = ''")
             conn.execute("UPDATE incidents SET last_seen_at = detected_at "
@@ -434,15 +300,7 @@ class CaseStore:
             pass
 
     def reset(self) -> None:
-        """Drop all rows from every table (preserves schema).
-
-        Wrapped in BEGIN IMMEDIATE with PRAGMA foreign_keys = OFF so a
-        concurrent writer (worker-pool daemon in another process, or a
-        scanner thread that's still mid-job) can't re-introduce child
-        rows between our DELETE FROM audit_trail and DELETE FROM
-        incidents and trip "FOREIGN KEY constraint failed". The deletes
-        commit atomically; FKs are restored before we return.
-        """
+        
         conn = self.connect()
         try:
             conn.execute("PRAGMA foreign_keys = OFF")
@@ -466,10 +324,7 @@ class CaseStore:
         self._invalidate_summary_cache()
 
     def _candidate_source_paths(self, source_path: str) -> list:
-        """Return every plausible textual variant of a source_path so the
-        purge / count logic survives Windows/POSIX slash drift and case
-        differences. SQLite '=' is byte-exact so we must enumerate variants
-        rather than rely on string equality alone."""
+      
         if not source_path:
             return []
         try:
@@ -485,29 +340,21 @@ class CaseStore:
 
     def count_source_incidents(self, source_path: str,
                                match_by_filename: bool = False) -> int:
-        """Count incidents tied to a source_path (with slash-variant
-        tolerance). If match_by_filename=True, also count incidents whose
-        source_path BASENAME matches -- catches orphans left when a source
-        was renamed or re-added under a new path."""
+        
         cands = self._candidate_source_paths(source_path)
         if not cands:
             return 0
         conn = self.connect()
         placeholders = ",".join("?" * len(cands))
-        # Build one OR'd WHERE so each matching row is counted exactly once
-        # (no additive double-counting across clauses).
+      
         clauses = [f"source_path IN ({placeholders})"]
         params = list(cands)
         if match_by_filename:
             base = Path(source_path).name
-            # Same-basename rows -- catches a source re-added under a new path.
+            
             clauses.append("source_path LIKE ? OR source_path LIKE ?")
             params += [f"%/{base}", f"%\\{base}"]
-            # Directory sources: a folder source (e.g. an EVTX directory) stores
-            # its incidents under the per-FILE paths that live inside it, so the
-            # exact/basename matches above never hit. Count descendants of the
-            # folder too. LIKE wildcards are escaped because EVTX filenames
-            # legitimately contain '%' (e.g. "...SMBServer%4Security.evtx").
+           
             norm = source_path.replace("\\", "/").rstrip("/")
             if norm:
                 esc = (norm.replace("\\", "\\\\")
@@ -519,9 +366,7 @@ class CaseStore:
         return int(conn.execute(sql, params).fetchone()[0])
 
     def count_orphan_incidents(self, active_source_paths: list) -> int:
-        """How many incidents are NOT tied to any path in active_source_paths
-        (path equality across slash variants). Used by the Rescan flow to
-        offer cleanup of incidents whose source has been removed/renamed."""
+     
         active_variants = set()
         for p in active_source_paths or []:
             for v in self._candidate_source_paths(p):
@@ -529,7 +374,7 @@ class CaseStore:
         active_variants.discard("")
         conn = self.connect()
         if not active_variants:
-            # No registered sources -- ALL incidents are orphans by definition.
+          
             return int(conn.execute(
                 "SELECT COUNT(*) FROM incidents").fetchone()[0])
         placeholders = ",".join("?" * len(active_variants))
@@ -541,8 +386,7 @@ class CaseStore:
             params).fetchone()[0])
 
     def purge_orphan_incidents(self, active_source_paths: list) -> int:
-        """Delete every incident (and its child rows) whose source_path does
-        not match any path in active_source_paths. Returns the count removed."""
+      
         active_variants = set()
         for p in active_source_paths or []:
             for v in self._candidate_source_paths(p):
@@ -576,19 +420,7 @@ class CaseStore:
 
     def purge_source(self, source_path: str,
                      match_by_filename: bool = False) -> int:
-        """Delete every incident (and its child rows) created from a given
-        source_path. Used by the Data Sources tab's Rescan button.
-
-        Path comparison is slash-variant tolerant (Windows file paths get
-        persisted with backslashes in some code paths and forward slashes
-        in others -- equality alone misses ~half the matches).
-
-        Set match_by_filename=True to ALSO sweep incidents whose
-        source_path BASENAME matches (e.g. cleans up orphans from a source
-        that was renamed or re-added under a new path).
-
-        Returns the number of incidents removed.
-        """
+      
         cands = self._candidate_source_paths(source_path)
         if not cands:
             return 0
@@ -607,7 +439,7 @@ class CaseStore:
         inc_ids = [row[0] for row in cur.fetchall()]
         if not inc_ids:
             return 0
-        # Delete child rows first (FKs are on but no ON DELETE CASCADE).
+      
         ph_inc = ",".join("?" * len(inc_ids))
         for tbl in ("notifications_log", "audit_trail", "evidence_chain",
                     "playbook_execution", "incident_occurrences"):
@@ -620,24 +452,9 @@ class CaseStore:
         self._invalidate_summary_cache()
         return len(inc_ids)
 
-    # ------------------------------------------------------------------
-    # Incident CRUD
-    # ------------------------------------------------------------------
+
     def next_incident_id(self, prefix: str = "INC") -> str:
-        """Generate the next incident_id in the form INC-YYYY-NNNNNN.
-
-        Iterates all current-year IDs and picks the NUMERIC max + 1.
-        The naive "ORDER BY incident_id DESC LIMIT 1" approach lexically
-        sorts "INC-YYYY-9999" above "INC-YYYY-10000" (because '9' > '1'),
-        so once the sequence crosses 9999 every subsequent call hands
-        out a colliding 10000 and every insert dies with
-        "UNIQUE constraint failed: incidents.incident_id". A 10-k-row
-        scan is a few ms in SQLite, so iterate.
-
-        Suffix width widened from 4 -> 6 digits for forward-compat;
-        existing 4-digit IDs are still recognised because we split on
-        '-' rather than slicing fixed offsets.
-        """
+       
         year = datetime.now().year
         conn = self.connect()
         cur  = conn.execute(
@@ -685,28 +502,10 @@ class CaseStore:
                         rule_id:             str  = "",
                         return_status:       bool = False,
                         ):
-        """Persist an incident, merging into an existing OPEN incident when
-        (source_host, incident_type, attack_technique) collides.
-
-        Merge semantics:
-          - dedup_key = sha1(host|type|technique)[:16]; empty when host is
-            blank, in which case we always insert a fresh row (can't safely
-            collapse cross-host incidents)
-          - On merge: incident_id of the existing row is returned. its_score
-            escalates via `_escalated_its(base_its, new_count)`, severity is
-            re-derived from the escalated value, last_seen_at is bumped,
-            occurrence_count increments, and a row lands in
-            `incident_occurrences` carrying the per-event traceability so
-            forensics still has the full event ledger.
-          - Audit log records DEDUP_MERGE rather than INCIDENT_CREATED.
-        Returns the incident_id (existing on merge, new on create).
-        """
+        
         conn = self.connect()
         ts = (detected_at or datetime.now()).isoformat()
-        # Normalize source_path to forward slashes so case-store lookups
-        # don't get split across slash-style variants. Different write
-        # paths (in-process worker, worker-pool daemon, bulk subprocess)
-        # otherwise persist the same logical file under two textual forms.
+       
         if source_path:
             source_path = source_path.replace("\\", "/")
         if source_csv_path:
@@ -731,25 +530,14 @@ class CaseStore:
                     "  last_seen_at = ?, its_score = ?, severity = ? "
                     "WHERE incident_id = ?",
                     (new_count, ts, eff_its, new_sev, existing_id))
-                # A merge mutates occurrence_count / its_score / last_seen_at,
-                # so the dashboard watermark MUST bump even though we only
-                # write an audit row once (below). Without this, every merge
-                # past the 2nd left data_version unchanged and the Incidents
-                # tab never re-rendered -- the count column froze while the
-                # real occurrence_count kept climbing into the thousands.
+                
                 self._invalidate_summary_cache()
-                # Forensic ledger: keep only the first N raw events per
-                # incident (occurrence_count above stays exact). A 29k-event
-                # EVTX burst would otherwise write 29k occurrence rows.
+               
                 if new_count <= _MAX_OCCURRENCES_PER_INCIDENT:
                     self._log_occurrence(existing_id, ts, its_score,
                                          source_path, source_row_index,
                                          source_event_hash)
-                # Audit ONCE per incident (on the first merge), not per event.
-                # Writing a DEDUP_MERGE row for every merged event ballooned
-                # the audit_trail to 100k+ rows on a single EVTX scan; the
-                # incident's occurrence_count + last_seen_at already record
-                # the running tally for any later reader.
+              
                 if new_count == 2:
                     self.log_audit(
                         existing_id, action="DEDUP_MERGE",
@@ -760,7 +548,6 @@ class CaseStore:
                             f"occurrence_count silently"))
                 return (existing_id, "merged") if return_status else existing_id
 
-        # --- Fresh-insert path --------------------------------------------
         inc_id = incident_id or self.next_incident_id()
         conn.execute(
             "INSERT INTO incidents (incident_id, incident_type, detected_at, "
@@ -785,8 +572,7 @@ class CaseStore:
              rule_incident_type, rule_label, rule_severity, rule_id))
         self._log_occurrence(inc_id, ts, its_score, source_path,
                              source_row_index, source_event_hash)
-        # Include the source in the audit change_summary so chain readers
-        # can reconstruct origin even from the audit log alone.
+       
         src_tag = (f" source_kind={source_kind}" if source_kind else "") + \
                   (f" source_name={source_name}" if source_name else "") + \
                   (f" host={source_host}" if source_host else "")
@@ -799,10 +585,7 @@ class CaseStore:
     def _log_occurrence(self, incident_id: str, observed_at: str,
                         its_score: float, source_path: str,
                         source_row_index: int, source_event_hash: str) -> None:
-        """Insert one row into incident_occurrences. Called from both the
-        fresh-create and merge branches of create_incident so the forensic
-        ledger captures every raw event regardless of how the parent
-        incident was persisted."""
+     
         try:
             self.connect().execute(
                 "INSERT INTO incident_occurrences "
@@ -812,14 +595,11 @@ class CaseStore:
                 (incident_id, observed_at, float(its_score),
                  source_path, int(source_row_index), source_event_hash))
         except sqlite3.OperationalError:
-            # Table missing on a very old DB that skipped init_schema().
-            # Don't let the ledger insert break the parent persistence.
+           
             pass
 
     def get_occurrences(self, incident_id: str) -> List[Dict[str, Any]]:
-        """Return the chronological list of raw events behind an incident.
-        Used by the Incident Detail view to show 'this incident represents
-        N events between T0 and T1'."""
+      
         conn = self.connect()
         rows = conn.execute(
             "SELECT * FROM incident_occurrences WHERE incident_id = ? "
@@ -827,9 +607,7 @@ class CaseStore:
         return [dict(r) for r in rows]
 
     def exists_by_event_hash(self, event_hash: str) -> bool:
-        """Return True if any incident already carries this
-        source_event_hash. Used by the EVTX episode promoter to avoid
-        re-persisting the same episode on re-scan."""
+       
         if not event_hash:
             return False
         conn = self.connect()
@@ -884,9 +662,6 @@ class CaseStore:
     def list_open_incidents(self) -> List[Incident]:
         return self.list_incidents(status="OPEN")
 
-    # ------------------------------------------------------------------
-    # Playbook execution log
-    # ------------------------------------------------------------------
     def log_playbook_step(self, incident_id: str, step_id: str,
                           executed_by: str = "system",
                           outcome: str = "COMPLETED",
@@ -920,9 +695,6 @@ class CaseStore:
                 "ORDER BY executed_at ASC", (incident_id,)).fetchall()
         return [dict(r) for r in rows]
 
-    # ------------------------------------------------------------------
-    # Evidence chain
-    # ------------------------------------------------------------------
     @staticmethod
     def sha256(path: Path) -> str:
         h = hashlib.sha256()
@@ -966,9 +738,7 @@ class CaseStore:
                 "ORDER BY collected_at ASC", (incident_id,)).fetchall()
         return [dict(r) for r in rows]
 
-    # ------------------------------------------------------------------
-    # Audit trail
-    # ------------------------------------------------------------------
+ 
     def log_audit(self, incident_id: Optional[str], action: str,
                   performed_by: str = "system", ip_address: str = "",
                   change_summary: str = "",
@@ -985,10 +755,7 @@ class CaseStore:
 
     def get_audit_trail(self, incident_id: str,
                         limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Audit rows for an incident, chronological (ASC). `limit` caps to the
-        most-recent N rows (still returned ASC) -- used by the dashboard to
-        avoid loading a legacy incident's 80k+ trail into the UI. Reports pass
-        no limit and get the full trail."""
+        
         conn = self.connect()
         if limit and int(limit) > 0:
             rows = conn.execute(
@@ -1010,9 +777,7 @@ class CaseStore:
             "SELECT COUNT(*) FROM audit_trail WHERE incident_id=?",
             (incident_id,)).fetchone()[0])
 
-    # ------------------------------------------------------------------
-    # Notifications log
-    # ------------------------------------------------------------------
+  
     def log_notification(self, incident_id: str, channel: str,
                          recipient: str, delivery_status: str = "SENT",
                          subject: str = "", body_excerpt: str = "",
@@ -1048,17 +813,11 @@ class CaseStore:
                 "ORDER BY sent_at ASC", (incident_id,)).fetchall()
         return [dict(r) for r in rows]
 
-    # ------------------------------------------------------------------
-    # Composite timeline
-    # ------------------------------------------------------------------
+ 
     def get_incident_timeline(self, incident_id: str,
                               limit: Optional[int] = None
                               ) -> List[Dict[str, Any]]:
-        """Returns a chronologically-merged timeline of audit_trail +
-        playbook_execution + evidence_chain + notifications_log events
-        for the incident. `limit` caps the audit pull AND the merged result to
-        the most-recent N events (the audit trail is the only source that can
-        balloon). Default None = full timeline (reports rely on this)."""
+      
         events: List[Dict[str, Any]] = []
         for r in self.get_audit_trail(incident_id, limit=limit):
             events.append({"ts": r["performed_at"], "type": "AUDIT",
@@ -1081,26 +840,17 @@ class CaseStore:
             events = events[-int(limit):]
         return events
 
-    # ------------------------------------------------------------------
-    # Summary statistics
-    # ------------------------------------------------------------------
-    # Summary stats are queried by every dashboard widget on every tick.
-    # We cache the result for a short TTL (default 1s) so a 6-widget
-    # refresh hits SQLite once instead of six times. The cache is
-    # invalidated on any write (create_incident, log_audit, etc.) below.
+   
     _summary_cache_ttl_s = 1.0
 
     def _invalidate_summary_cache(self) -> None:
         if hasattr(self, "_summary_cache"):
             self._summary_cache = None
-        # Bump the write watermark so dashboard widgets know to re-render.
+       
         self.data_version += 1
 
     def bump_data_version(self) -> int:
-        """Externally announce that the underlying SQLite file changed
-        beneath us (e.g. a worker-pool daemon wrote to it in another
-        process). The dashboard calls this after a successful pool
-        dispatch so widgets refresh from the new rows."""
+      
         self._invalidate_summary_cache()
         return self.data_version
 
@@ -1134,9 +884,7 @@ class CaseStore:
         return payload
 
 
-# ---------------------------------------------------------------------------
-# CLI smoke test (uses a throwaway db in /tmp-like location)
-# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     import tempfile
     tmp = Path(tempfile.gettempdir()) / "eirp_cases_smoke.db"
@@ -1146,7 +894,6 @@ if __name__ == "__main__":
     store = CaseStore(tmp)
     store.init_schema()
 
-    # Create three incidents
     inc1 = store.create_incident("INC-01", 0.78, "HIGH",
         attack_tactic="TA0010", attack_technique="T1041",
         assigned_to="IT_SECURITY+DPO", playbook_id="PB-01",
@@ -1162,7 +909,7 @@ if __name__ == "__main__":
 
     print(f"Created incidents: {inc1}, {inc2}, {inc3}")
 
-    # Walk through PB-01 for inc1
+  
     pb01_steps = ["PB-01-S01","PB-01-S02","PB-01-S03","PB-01-S04",
                   "PB-01-S05","PB-01-S06"]
     for s in pb01_steps:
