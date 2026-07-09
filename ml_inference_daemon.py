@@ -1,39 +1,3 @@
-#!/usr/bin/env python3
-"""
-================================================================================
-ml_inference_daemon.py
-EIRP-EMR  |  HTTP Inference Daemon (worker process for the dashboard pool)
-================================================================================
-
-A long-running scoring service that loads one EIRPInferenceEngine and answers
-HTTP JSON requests over a TCP port. The dashboard's WorkerPool spawns one or
-more of these so live + bulk inference can run in parallel processes (real
-parallelism, not just QThreads under the GIL).
-
-Endpoints
----------
-GET  /healthz        ->  {"ok": true, "engine_loaded": true, "uptime_s": N,
-                          "lane": "live"|"bulk", "port": int}
-GET  /stats          ->  counters (jobs_done, rows_scored, incidents_persisted,
-                          last_job_ms, avg_job_ms)
-POST /score          body: {"csv": "<path>", "source": "lira"|"access"|...,
-                            "max_incidents": int (optional)}
-                     ->  {"ok": true, "rows": N, "incidents": M,
-                          "elapsed_ms": float}
-POST /shutdown       graceful shutdown (in-flight job finishes first)
-
-Usage
------
-    python ml_inference_daemon.py --port 8765 --db eirp_cases.db --lane live
-    python ml_inference_daemon.py --port 8766 --db eirp_cases.db --lane bulk \
-                                  --max-incidents 1000
-
-The daemon writes to the SAME SQLite case_store as the dashboard; SQLite WAL
-mode (enabled in CaseStore.connect) makes concurrent writers safe.
-
-Memory note: each daemon loads its own copy of all ML models (~700 MB).
-On a 4 GB hospital server budget for at most 2 daemons.
-"""
 from __future__ import annotations
 
 import argparse
@@ -47,10 +11,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 
-
-# ---------------------------------------------------------------------------
-# Lazy engine import -- keeps unit tests of the daemon CLI fast
-# ---------------------------------------------------------------------------
 _engine = None
 _engine_load_ts: Optional[float] = None
 _lock = threading.Lock()
@@ -85,12 +45,8 @@ def _load_engine() -> None:
     _engine_load_ts = time.time() - t0
 
 
-# ---------------------------------------------------------------------------
 class InferenceHandler(BaseHTTPRequestHandler):
-    """JSON-over-HTTP request handler. All endpoints are non-blocking from
-    the client's perspective; the daemon serialises actual scoring through
-    one lock so SQLite writes stay consistent."""
-
+    
     server_version = "EIRP-Inference/1.0"
 
     # --- helpers ------------------------------------------------------
@@ -113,7 +69,7 @@ class InferenceHandler(BaseHTTPRequestHandler):
             raise ValueError(f"bad JSON: {exc}")
 
     def log_message(self, fmt, *args):
-        # Keep stdout clean; daemon prints its own status updates
+        
         return
 
     # --- GET handlers --------------------------------------------------
@@ -189,17 +145,12 @@ class InferenceHandler(BaseHTTPRequestHandler):
 def _score_one(csv_path: str, source: str,
                max_incidents: Optional[int],
                source_name: str = "", source_path: str = "") -> dict:
-    """Serialised score call. Holds the global lock so only one scoring
-    pass runs at a time per daemon process (preserves SQLite write order)."""
+   
     import pandas as pd
     p = Path(csv_path)
     if not p.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
-    # An empty CSV is a valid "nothing to score" outcome -- e.g. a clean scan
-    # that produced no events, or the _empty.csv placeholder. A zero-byte /
-    # header-less file makes pd.read_csv raise EmptyDataError; a header-only
-    # file yields a 0-row frame. Either way, short-circuit to a clean
-    # zero-result so the dispatcher sees rows=0 instead of an HTTP 500.
+   
     try:
         df = pd.read_csv(p)
     except pd.errors.EmptyDataError:
@@ -220,13 +171,7 @@ def _score_one(csv_path: str, source: str,
         if _engine is None:
             raise RuntimeError("engine not loaded yet")
         if max_incidents is not None:
-            # The engine stores the cap in `self.max_incidents`
-            # (ml_inference.py:810). Writing to `max_incidents_per_run`
-            # was a name typo -- it created a dummy attribute the
-            # engine never reads, so the cap stayed pinned at whatever
-            # the daemon was launched with (default 1000) regardless of
-            # what the dispatcher sent. Symptom: every source's incident
-            # count clamped to exactly 1000.
+        
             _engine.max_incidents = int(max_incidents)
         t0 = time.time()
         scored = _engine.score(
@@ -256,7 +201,6 @@ def _score_one(csv_path: str, source: str,
     }
 
 
-# ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="EIRP-EMR HTTP inference daemon")
@@ -289,7 +233,7 @@ def main() -> int:
     _args = parse_args()
     print(f"[daemon:{_args.port}] {_args.lane}-lane starting...", flush=True)
 
-    # Load engine in a background thread so we can answer /healthz right away
+    
     def _bg_load():
         try:
             _load_engine()

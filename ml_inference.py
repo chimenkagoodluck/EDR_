@@ -1,86 +1,3 @@
-#!/usr/bin/env python3
-"""
-================================================================================
-ml_inference.py
-EIRP-EMR Inference and Remote Validation Engine  |  Phase 1, Build Step 2 of 9
-================================================================================
-
-PURPOSE
--------
-This script is the REMOTE VALIDATION PACKET for the EIRP-EMR research.
-
-It can be run on ANY machine that has:
-  1. Python 3.11+ with the project virtual environment (venv/)
-  2. A CSV file output from any EIRP-EMR Tier 1 parser
-     (LIRA / Apache Access / Apache Error / WELA)
-  3. The trained Isolation Forest model in models/isolation_forest.pkl
-     (produced by: python ml_dataset_builder.py --model A)
-  4. (Optional) Tier 2 Model B at models/model_B_unified.pkl
-     (produced by: python ml_train_model_b.py + ml_retrain_model_b_v2.py)
-     If present, every event also receives a unified incident-class label:
-     NORMAL / BRUTE_FORCE / PHI_BREACH / RANSOMWARE / DATA_CORRUPTION /
-     INSIDER / INFRA_FAULT
-
-TYPICAL USAGE
--------------
-  # Score a LIRA parser CSV export:
-  python ml_inference.py --csv LIRA_2026_Output/LIRA_2026_00_master_all_events.csv
-
-  # Score an Access Log CSV export with explicit source type:
-  python ml_inference.py --csv Access_Log_Output/access_00_master_all_events.csv --source access
-
-  # Run built-in demonstration using saved ML_Datasets/ samples:
-  python ml_inference.py --demo
-
-  # Run on a folder of CSVs and save a JSON report for emailing:
-  python ml_inference.py --csv my_logs.csv --out report_2026.json
-
-WHAT THIS SCRIPT DOES
----------------------
-  1. Loads the CSV input and auto-detects the source parser type
-     (LIRA / Apache Access / Apache Error / Windows EVTX)
-  2. Extracts the Common Event Schema (CES) features used by the
-     Isolation Forest — the same 13-column normalised feature space
-     built in ml_dataset_builder.py
-  3. Loads models/isolation_forest.pkl and scores every event with an
-     anomaly_score in [0.0, 1.0]  (0 = normal, 1 = highly anomalous)
-  4. Loads any available supervised model .pkl files from models/ and
-     runs per-source predictions (models trained by ml_train_*.py)
-  5. (Tier 2) If models/model_B_unified.pkl is present, runs the unified
-     XGBoost meta-classifier on every event using the 14-feature input
-     [13 CES columns + anomaly_score] and assigns a unified incident class
-     plus per-class probability
-  5b.(Tier 3) If models/model_C_response_policy.json is present, runs the
-     rule-based response engine (model_c_engine.ResponseEngine) on every
-     event using (model_b_label, model_b_confidence, its_severity, hour,
-     day_of_week) and produces per-event response_actions, queued
-     confirmation_actions, downgrade flags, and a decision rationale
-  6. Computes an Incident Threat Score (ITS) per event using the
-     EIRP-EMR formula from the architecture document:
-       ITS = (base_severity × 0.40)
-           + (anomaly_score × 0.30)
-           + (cross_hits    × 0.20)   ← 0 until correlation engine built
-           + (after_hours   × 0.10)
-  7. Classifies each event by ITS threshold:
-       LOW      [0.00–0.30] : log only
-       MEDIUM   [0.30–0.60] : dashboard alert
-       HIGH     [0.60–0.80] : open incident case
-       CRITICAL [0.80–1.00] : execute playbook immediately
-  8. Outputs a formatted console report and saves a timestamped JSON file
-     that can be emailed to the researcher for remote validation
-
-RESEARCH CONTEXT
-----------------
-  PhD Research  : "An Enhanced Incident Response Plan for EMR Systems
-                   at Tertiary Health Facilities in Nigeria"
-  Researcher    : Alozie Obidinma Christian (EBSU/PG/PhD/2023/11861)
-  Supervisor    : Dr. Ituma, Ebonyi State University
-  Case Hospital : ESUTH / DUFUTH
-  Architecture  : NIST CSF — Tier 2 Detection Engine (Detect function)
-
-================================================================================
-"""
-
 import os
 import sys
 import json
@@ -95,8 +12,9 @@ from typing import Optional, List, Dict, Any
 import numpy as np
 import pandas as pd
 import joblib
+from rundemo import run_demo
 
-# Tier 3 response engine (rule-based, no ML weights)
+
 try:
     from model_c_engine import ResponseEngine, POLICY_PATH as MODEL_C_POLICY_PATH
     _MODEL_C_AVAILABLE = True
@@ -105,7 +23,7 @@ except Exception:
     MODEL_C_POLICY_PATH = None
     _MODEL_C_AVAILABLE = False
 
-# Phase 2 enrichment: correlation + ATT&CK + threat-score (architecture doc D2-D4)
+
 try:
     from ml_threat_scorer     import ThreatScorer
     from ml_correlation_engine import CorrelationEngine
@@ -117,12 +35,6 @@ except Exception as _phase2_exc:
     AttackMapper = None
     _PHASE2_AVAILABLE = False
 
-# Tier 3+ incident lifecycle (architecture doc Sections E1-E4):
-#   IncidentClassifier   model_b_label + ITS + COR -> INC-01..INC-06
-#   PlaybookEngine       PB-01..PB-06 step sequencing + deadline tracking
-#   CaseStore            SQLite persistence (incidents, playbook_execution,
-#                        evidence_chain, audit_trail, notifications_log)
-#   Notifier             severity-routed email + SMS dispatch (smtplib + Termii)
 try:
     from response import (
         IncidentClassifier, PlaybookEngine, CaseStore, Notifier,
@@ -135,10 +47,7 @@ except Exception:
     Notifier           = None
     _LIFECYCLE_AVAILABLE = False
 
-# Tier 4 recovery + continuity (architecture doc Section F):
-#   ContainmentAdvisor   per-INC-id action list, priority + RTO impact
-#   RecoveryChecklist    sequenced restoration steps + RTO target
-#   BCPMonitor           paper protocol generation for CRITICAL outages
+
 try:
     from recovery import ContainmentAdvisor, RecoveryChecklist, BCPMonitor
     _RECOVERY_AVAILABLE = True
@@ -148,13 +57,9 @@ except Exception:
     BCPMonitor         = None
     _RECOVERY_AVAILABLE = False
 
-# BCP auto-activates on CRITICAL severity for these INC types (arch doc Section F)
+
 BCP_ACTIVATION_INC_TYPES = {"INC-02", "INC-03"}
 
-# Tier 5 reporting (architecture doc Section G):
-#   AuditManager      tamper-evident SHA-256-chained audit log writer
-#   NdprMapper        NDPR compliance gap auditor
-#   ReportGenerator   PDF + Excel report exporter
 try:
     from reporting import AuditManager, NdprMapper, ReportGenerator
     _REPORTING_AVAILABLE = True
@@ -166,15 +71,11 @@ except Exception:
 
 warnings.filterwarnings("ignore")
 
-# =============================================================================
-# SECTION 1 — CONFIGURATION
-# =============================================================================
-
 BASE_DIR    = Path(__file__).parent.resolve()
 MODELS_DIR  = BASE_DIR / "models"
 DATASETS_DIR= BASE_DIR / "ML_Datasets"
 
-# ITS formula weights (from EIRP-EMR Architecture, Section D4)
+
 ITS_W_SEVERITY    = 0.40
 ITS_W_ANOMALY     = 0.30
 ITS_W_CORRELATION = 0.20   # reserved; 0.0 until correlation engine (Phase 2)
@@ -187,53 +88,23 @@ ITS_THRESHOLDS = [
     (0.00, "LOW",      "Log only"),
 ]
 
-# Tier 2 unified meta-classifier (Model B) — see ml_train_model_b.py + ml_retrain_model_b_v2.py
+
 MODEL_B_FILE         = "model_B_unified.pkl"
 MODEL_B_ENCODER_FILE = "model_B_unified_encoder.pkl"
-# Model B input order: 13 CES columns + anomaly_score
+
 MODEL_B_FEATURES     = None  # set after CES_COLUMNS is defined (see below)
 
-# Supervised model registry — paths written by ml_train_*.py scripts
+
 SUPERVISED_MODELS = {
     1: {"file": "model_01_downtime.pkl",                   "source": "lira",   "name": "DB Downtime"},
     2: {"file": "model_02_corruption.pkl",                 "source": "lira",   "name": "DB Corruption"},
     3: {"file": "model_03_unauthorized.pkl",               "source": "lira",   "name": "DB Unauthorized"},
-    # Model 4 promoted to v4 Stage 1 binary classifier (NORMAL vs SUSPICIOUS,
-    # F1=0.905 on held-out test set; replaces the v1 9-class which only
-    # achieved macro_F1=0.358 due to intrinsic label inconsistency in the
-    # source dataset). See results/model_04_retrain_comparison.json.
     4: {"file": "model_04_web_anomaly_v4_stage1.pkl",      "source": "access", "name": "Web Suspicious (binary v4)"},
-    # Model 5 promoted to v2 (process-lifecycle collapse) -- macro_F1 jumped
-    # from 0.537 (v1) to 1.000 (v2, both RF + XGB). Collapsed 13 classes -> 7:
-    # 6 distinguishable security/operational classes + PROCESS_LIFECYCLE
-    # (server start/stop, worker mgmt, process spawn/exit). See
-    # results/model_05_v2_retrain/evaluation.json.
     5: {"file": "model_05_web_error_v2.pkl",               "source": "error",  "name": "Web Error v2"},
     6: {"file": "model_06_windows_security.pkl",           "source": "evtx",   "name": "Windows Security"},
     7: {"file": "model_07_endpoint_threat.pkl",            "source": "evtx",   "name": "Endpoint Threat"},
 }
 
-# ---------------------------------------------------------------------------
-# Per-model row-eligibility predicates (Tier 2 routing).
-#
-# Each predicate takes the parser-output DataFrame and returns a boolean mask
-# of which rows that model should score. Signals come from the EXACT columns
-# the training-set selectors used in ml_dataset_builder.py / the LIRA + EVTX
-# parsers; this guarantees we only feed each model the kind of event it was
-# trained to discriminate.
-#
-#   - LIRA models 1/2/3: master CSV's "model_flags" column (string list set
-#     by LIRA_*_parser.py:990-994 when assembling per-model training CSVs).
-#   - EVTX models 6/7  : "channel_key" column, restricted to the channels
-#     present in each model's metadata.json categorical_encoders.channel_key.
-#   - Models 4/5      : sole models for their source -- always eligible.
-#
-# A row may be scored by 0, 1, or N models. Missing columns => empty mask
-# (the model is skipped for that scan, never crashes).
-# ---------------------------------------------------------------------------
-
-# EVTX channels each model was trained on (from metadata.json
-# categorical_encoders.channel_key for models 6 and 7 respectively).
 MODEL_6_CHANNELS = frozenset({
     "application", "defender", "firewall", "grouppolicy", "rdp",
     "security", "smb_operational", "smb_security", "system",
@@ -247,7 +118,6 @@ MODEL_7_CHANNELS = frozenset({
 
 
 def _flag_contains(df: pd.DataFrame, flag: str) -> "pd.Series":
-    """True for rows whose model_flags column lists the given flag."""
     if "model_flags" not in df.columns:
         return pd.Series(False, index=df.index)
     return df["model_flags"].fillna("").astype(str).str.contains(
@@ -273,7 +143,7 @@ MODEL_ELIGIBILITY = {
 }
 
 
-# CES feature columns (must match ml_dataset_builder.py CES_COLUMNS exactly)
+
 CES_COLUMNS = [
     "ces_hour", "ces_day_of_week", "ces_is_weekend", "ces_is_after_hours",
     "ces_severity_norm", "ces_confidence_norm", "ces_auth_fail_flag",
@@ -281,7 +151,7 @@ CES_COLUMNS = [
     "ces_source_lira", "ces_source_access", "ces_source_error", "ces_source_evtx",
 ]
 
-# Model B feature order: CES + anomaly_score (must match ml_train_model_b.py)
+
 MODEL_B_FEATURES = CES_COLUMNS + ["anomaly_score"]
 
 DAY_OF_WEEK_MAP = {
@@ -295,25 +165,6 @@ MONTH_MAP = {
 }
 SEVERITY_ORDINAL = {"NORMAL": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
-
-# ---------------------------------------------------------------------------
-# Per-source schema contracts (Q#4: parser-output validation).
-#
-# The CES extractor + supervised models + incident classifier silently treat
-# a missing column as a zeroed feature. That's safe for crash-tolerance but
-# pathologically wrong for accuracy: a parser regression that drops or
-# renames `severity_score` doesn't error -- every event just scores 0 on
-# severity and Model B sees a uniform feature column.
-#
-# `required` = columns whose absence guarantees systematically wrong scores
-#              (they feed directly into CES extraction or block routing).
-# `recommended` = columns that downstream consumers (traceability hash,
-#                 supervised model routing, incident classifier) fall back
-#                 from gracefully, but quality degrades when missing.
-#
-# Validator results land in engine.last_validation so the dashboard +
-# build_report() can surface "scoring proceeded but parser is drifting".
-# ---------------------------------------------------------------------------
 
 SOURCE_SCHEMAS = {
     "lira": {
@@ -366,10 +217,9 @@ SOURCE_SCHEMAS = {
 
 
 def validate_source_schema(df: pd.DataFrame, source: str) -> dict:
-    """Compare parser-output columns against SOURCE_SCHEMAS[source].
+    """
 
-    Returns a dict suitable for stashing on the engine and surfacing in
-    reports / dashboard widgets:
+    
         {
           "source":               <str>,
           "n_rows":               <int>,
@@ -380,7 +230,7 @@ def validate_source_schema(df: pd.DataFrame, source: str) -> dict:
           "ok":                   bool,           # True iff no required miss
         }
 
-    Never raises -- a parser drift should be observable, not fatal.
+   
     """
     schema = SOURCE_SCHEMAS.get(source)
     cols   = set(df.columns)
@@ -401,15 +251,9 @@ def validate_source_schema(df: pd.DataFrame, source: str) -> dict:
     }
 
 
-# =============================================================================
-# SECTION 2 — SOURCE AUTO-DETECTION
-# =============================================================================
 
 def detect_source(df: pd.DataFrame) -> str:
-    """
-    Infer the parser source from column signatures.
-    Returns one of: 'lira', 'access', 'error', 'evtx'
-    """
+    
     cols = set(df.columns)
     if "is_crash_recovery" in cols and "startup_context" in cols:
         return "lira"
@@ -429,9 +273,6 @@ def detect_source(df: pd.DataFrame) -> str:
     return max(scores, key=scores.get)
 
 
-# =============================================================================
-# SECTION 3 — CES FEATURE EXTRACTION (mirrors ml_dataset_builder.py)
-# =============================================================================
 
 def _norm(series: pd.Series) -> pd.Series:
     lo, hi = series.min(), series.max()
@@ -458,10 +299,7 @@ def _encode_temporal(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def extract_ces_features(df: pd.DataFrame, source: str) -> pd.DataFrame:
-    """
-    Transform a parser-output DataFrame into the 13-column CES feature matrix
-    used by the Isolation Forest. Logic mirrors ml_dataset_builder.py extractors.
-    """
+    
     ces = pd.DataFrame(index=df.index)
 
     if source == "lira":
@@ -526,9 +364,6 @@ def extract_ces_features(df: pd.DataFrame, source: str) -> pd.DataFrame:
     return ces[CES_COLUMNS].fillna(0).apply(pd.to_numeric, errors="coerce").fillna(0)
 
 
-# =============================================================================
-# SECTION 4 — FEATURE EXTRACTION FOR SUPERVISED MODELS
-# =============================================================================
 
 LIRA_SUPERVISED_FEATURES = [
     "hour", "day_of_week", "month", "year", "severity_score", "confidence",
@@ -538,13 +373,7 @@ LIRA_SUPERVISED_FEATURES = [
     "severity", "host_status", "user_status", "startup_context",
 ]
 
-# ─── Access-source supervised features (Model 4) ────────────────────────────
-# Must match the order recorded in
-# ML_Datasets/model_04_web_traffic_anomaly_classifier/metadata.json
-# feature_names. The categorical columns are integer-encoded with the SAME
-# alphabetical mapping the dataset_builder used (also recorded in metadata.json
-# under "categorical_encoders"); applying any other ordering produces silent
-# garbage predictions.
+
 ACCESS_SUPERVISED_FEATURES = [
     "hour", "day_of_week", "month", "year",
     "status_code", "response_bytes", "uri_depth", "uri_length",
@@ -570,23 +399,7 @@ ACCESS_CATEGORICAL_ENCODERS = {
 
 
 def _canonical_event_hash(row, source_kind: str) -> str:
-    """Stable fingerprint for one scored row, used as incidents.source_event_hash.
-
-    Strategy:
-      - If the parser already supplied a `fingerprint` column (LIRA does),
-        use it verbatim. Re-parsing the same input produces the same
-        fingerprint, so the incident stays linked across reruns.
-      - Otherwise hash a canonical tuple of fields per source kind. The
-        tuple is chosen so two distinct events can't collide:
-            lira  : timestamp + rule_id + message_preview
-            evtx  : source_file + channel_key + event_id + timestamp
-            access: timestamp + ip + method + uri + status_code
-            error : timestamp + severity + message_preview
-      - Falls back to a hash of `repr(row)` if all of the above is missing.
-
-    Returns a 16-char hex prefix (sha1 truncated) -- enough for billions of
-    events without collision and keeps the column readable in case_store.
-    """
+   
     import hashlib
 
     def _g(field: str) -> str:
@@ -598,7 +411,7 @@ def _canonical_event_hash(row, source_kind: str) -> str:
             return ""
         return str(v)
 
-    # Parser-supplied fingerprint wins outright.
+    
     fp = _g("fingerprint")
     if fp:
         return hashlib.sha1(fp.encode("utf-8")).hexdigest()[:16]
@@ -627,12 +440,7 @@ def _canonical_event_hash(row, source_kind: str) -> str:
 
 
 def _load_model_metadata(mid: int) -> Optional[dict]:
-    """Locate and parse ML_Datasets/model_0{mid}_*/metadata.json.
-
-    Returns None if the metadata file isn't on disk (e.g. deployment ship
-    that doesn't include ML_Datasets/) -- callers fall back to legacy
-    extraction in that case.
-    """
+ 
     import json
     if not DATASETS_DIR.exists():
         return None
@@ -650,24 +458,17 @@ def _load_model_metadata(mid: int) -> Optional[dict]:
 
 
 def _extract_features_for_model(df: pd.DataFrame, metadata: dict) -> np.ndarray:
-    """Build the EXACT feature matrix the model was trained on.
-
-    Uses metadata.feature_names for column order and
-    metadata.categorical_encoders for string -> integer index mapping.
-    Unknown categories map to -1 (tree models tolerate this; matches the
-    Access encoder's behaviour). Missing columns are filled with 0.
-    """
+   
     feature_names: list = list(metadata.get("feature_names") or [])
     cat_encoders:  dict = dict(metadata.get("categorical_encoders") or {})
     if not feature_names:
-        # Shouldn't happen for trained models; fall through to a zero matrix
-        # so the caller's try/except can record an error rather than crash.
+        
         return np.zeros((len(df), 0), dtype=float)
 
     work = df.copy()
     work = _encode_temporal(work)
 
-    # Build per-column categorical maps once
+    
     cat_maps = {col: {v: i for i, v in enumerate(cats)}
                 for col, cats in cat_encoders.items()}
 
@@ -694,31 +495,21 @@ def _extract_features_for_model(df: pd.DataFrame, metadata: dict) -> np.ndarray:
 
 def extract_supervised_features(df: pd.DataFrame, source: str,
                                  model_id: int) -> np.ndarray:
-    """
-    Legacy single-shape feature extractor (one schema per source).
-
-    Kept as a fallback path for the case where a model's metadata.json
-    isn't available on disk. Prefer _extract_features_for_model when
-    metadata is loaded -- it uses the model's exact training-time feature
-    list + categorical encoders.
-
-    For LIRA models: encodes temporal strings and label-encodes categoricals.
-    For access models: builds the exact 33-feature schema Model 4 was trained on.
-    """
+    
     from sklearn.preprocessing import LabelEncoder
 
     df = df.copy()
 
     if source == "lira":
         df = _encode_temporal(df)
-        # Ordinal-encode severity
+       
         if "severity" in df.columns:
             df["severity"] = df["severity"].map(SEVERITY_ORDINAL).fillna(0).astype(int)
-        # Label-encode remaining categoricals
+        
         for col in ["host_status", "user_status", "startup_context"]:
             if col in df.columns:
                 df[col] = LabelEncoder().fit_transform(df[col].astype(str))
-        # Binary flags
+        
         for col in ["is_crash_recovery","is_aria_recovery","is_service_startup",
                     "is_clean_shutdown","is_after_hours","is_aborted_connection",
                     "is_access_denied","is_dns_failure"]:
@@ -729,14 +520,14 @@ def extract_supervised_features(df: pd.DataFrame, source: str,
         return X.values.astype(float)
 
     if source == "access":
-        # Apply the exact categorical encoding the dataset_builder used.
+        
         for col, cats in ACCESS_CATEGORICAL_ENCODERS.items():
             mapping = {v: i for i, v in enumerate(cats)}
             if col in df.columns:
                 df[col] = df[col].fillna("unknown").astype(str).map(mapping).fillna(-1)
             else:
                 df[col] = 0
-        # Ensure every expected feature is present and numeric.
+        
         for f in ACCESS_SUPERVISED_FEATURES:
             if f not in df.columns:
                 df[f] = 0
@@ -744,21 +535,15 @@ def extract_supervised_features(df: pd.DataFrame, source: str,
             pd.to_numeric, errors="coerce").fillna(0)
         return X.values.astype(float)
 
-    # For error, evtx — fall back to basic numeric extraction.
+    
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     return df[numeric_cols].fillna(0).values.astype(float)
 
 
-# =============================================================================
-# SECTION 5 — ITS COMPUTATION
-# =============================================================================
 
 def compute_its(severity_norm: float, anomaly_score: float,
                 after_hours: float, cross_hits: float = 0.0) -> float:
-    """
-    Incident Threat Score (EIRP-EMR Architecture, Section D4).
-    All inputs must be in [0.0, 1.0].
-    """
+    
     its = (severity_norm * ITS_W_SEVERITY
            + anomaly_score * ITS_W_ANOMALY
            + cross_hits    * ITS_W_CORRELATION
@@ -767,27 +552,16 @@ def compute_its(severity_norm: float, anomaly_score: float,
 
 
 def classify_its(its: float) -> tuple:
-    """Return (severity_label, recommended_action) for a given ITS value."""
+    ""
     for threshold, label, action in ITS_THRESHOLDS:
         if its >= threshold:
             return label, action
     return "LOW", "Log only"
 
 
-# =============================================================================
-# SECTION 6 — INFERENCE ENGINE
-# =============================================================================
 
 class EIRPInferenceEngine:
-    """
-    Main inference engine for the EIRP-EMR remote validation packet.
-
-    Loads available trained models from models/ and scores input CSV files
-    through the full EIRP-EMR detection pipeline. Gracefully handles missing
-    supervised model files — the Isolation Forest alone is sufficient to
-    produce ITS scores for validation purposes.
-    """
-
+ 
     def __init__(self,
                  persist_incidents:        bool = True,
                  db_path:                  Optional[Path] = None,
@@ -796,14 +570,14 @@ class EIRPInferenceEngine:
                  max_incidents_per_run:    int  = 500,
                  recovery_modules_enabled: bool = True,
                  bcp_critical_only:        bool = True):
-        # Tier 1-3 models
+        
         self.iso_forest       = None
         self.model_b          = None
         self.model_b_encoder  = None
-        self.response_engine  = None   # Tier 3 -- model_c_engine.ResponseEngine
-        self.supervised       = {}   # {model_id: {"model": ..., "encoder": ...}}
+        self.response_engine  = None   
+        self.supervised       = {}   
 
-        # Tier 3+ incident lifecycle stack (architecture doc Section E)
+        
         self.incident_classifier      = None
         self.playbook_engine          = None
         self.case_store               = None
@@ -814,14 +588,14 @@ class EIRPInferenceEngine:
         self.max_incidents            = max_incidents_per_run
         self.db_path                  = Path(db_path) if db_path else (BASE_DIR / "eirp_cases.db")
 
-        # Tier 4 recovery + continuity stack (architecture doc Section F)
+        
         self.containment_advisor      = None
         self.recovery_checklist       = None
         self.bcp_monitor              = None
         self.recovery_modules_enabled = recovery_modules_enabled
         self.bcp_critical_only        = bcp_critical_only
 
-        # Phase 2 enrichment stack (architecture doc D2-D4)
+        
         self.threat_scorer       = None
         self.correlation_engine  = None
         self.attack_mapper       = None
@@ -833,8 +607,7 @@ class EIRPInferenceEngine:
             "its_summary":       {},
         }
 
-        # Per-run schema-validation report (reset on each score() call).
-        # Populated by validate_source_schema -- see Q#4 work.
+       
         self.last_validation: dict = {}
 
         # Per-run lifecycle tracker (reset on each score() call)
@@ -875,7 +648,7 @@ class EIRPInferenceEngine:
             print(f"  [--]  Tier 2 Model B not found at {b_path}")
             print(f"        Run: python ml_train_model_b.py + ml_retrain_model_b_v2.py")
 
-        # Tier 3 -- rule-based incident response engine (Model C)
+        
         if _MODEL_C_AVAILABLE and MODEL_C_POLICY_PATH and Path(MODEL_C_POLICY_PATH).exists():
             try:
                 self.response_engine = ResponseEngine()
@@ -897,11 +670,7 @@ class EIRPInferenceEngine:
                 m = {"model": joblib.load(model_path), "info": info}
                 if encoder_path.exists():
                     m["encoder"] = joblib.load(encoder_path)
-                # Load the training-time metadata (feature_names +
-                # categorical_encoders) so inference uses the exact same
-                # column order and encoding maps the model was trained on.
-                # Without this, label encoding is fit anew per batch and
-                # produces silently wrong predictions.
+                
                 meta = _load_model_metadata(mid)
                 if meta is not None:
                     m["metadata"] = meta
@@ -919,8 +688,7 @@ class EIRPInferenceEngine:
                       f"not yet trained (run ml_train_{info['name'].lower().replace(' ','_')}.py)")
 
     def _load_phase2_modules(self) -> None:
-        """Load Phase 2 enrichment stack (ThreatScorer + CorrelationEngine +
-        AttackMapper). All three are stateless and cheap to instantiate."""
+       
         if not _PHASE2_AVAILABLE:
             print(f"  [--]  Phase 2 enrichment stack unavailable "
                   f"(ml_threat_scorer/correlation/attack_mapper import failed)")
@@ -937,22 +705,12 @@ class EIRPInferenceEngine:
             self.correlation_engine = None
             self.attack_mapper = None
 
-    # ------------------------------------------------------------------
-    # Phase 2 helpers
-    # ------------------------------------------------------------------
     def _prepare_phase2_input(self, df: pd.DataFrame,
                               source: str) -> pd.DataFrame:
-        """Build the minimal frame CorrelationEngine/AttackMapper need.
-
-        CorrelationEngine.REQUIRED_COLS = (timestamp, source_type, subcategory).
-        The original df may not carry these names; we synthesise them in a
-        copy without mutating the caller. Single-source inference will
-        produce zero correlation hits for most COR rules (they're cross-
-        source by design); that's correct semantics, not an error.
-        """
+      
         out = df.copy()
 
-        # timestamp -> coerce to datetime
+       
         if "timestamp" not in out.columns:
             for src_col in ("timestamp_iso", "event_time", "datetime",
                             "@timestamp", "time", "timestamp_epoch"):
@@ -968,12 +726,10 @@ class EIRPInferenceEngine:
             else:
                 out["timestamp"] = pd.NaT
 
-        # source_type: pin to the source argument
+       
         out["source_type"] = source
 
-        # subcategory: prefer existing column; else derive from source-specific
-        # parser output columns. Falls back to "" which CorrelationEngine
-        # tolerates (rule matchers will just miss).
+      
         if "subcategory" not in out.columns:
             for src_col in ("event_subcategory", "incident_subcategory",
                             "sublabel", "category_name", "event_category",
@@ -984,7 +740,7 @@ class EIRPInferenceEngine:
             else:
                 out["subcategory"] = ""
 
-        # rule_id (optional but useful for downstream summaries)
+        
         if "rule_id" not in out.columns:
             for src_col in ("ruleid", "rule_code", "event_id"):
                 if src_col in out.columns:
@@ -994,11 +750,7 @@ class EIRPInferenceEngine:
         return out
 
     def _load_lifecycle_stack(self) -> None:
-        """
-        Load the Tier-3+ incident lifecycle modules (classifier + playbook
-        engine + case store + notifier). Each is optional and degrades
-        gracefully -- a missing component disables only that stage.
-        """
+       
         if not _LIFECYCLE_AVAILABLE:
             print(f"  [--]  Incident lifecycle stack unavailable "
                   f"(response/ package import failed)")
@@ -1080,15 +832,7 @@ class EIRPInferenceEngine:
                          include_pdf:   bool = True,
                          include_excel: bool = True,
                          include_audit: bool = True) -> Optional[Dict[str, Any]]:
-        """
-        Tier 5: produce PDF + Excel + signed-audit + NDPR reports for a set
-        of incidents. If `incident_ids` is None, defaults to the incidents
-        created in the most recent score() call; if no incidents were
-        created in this run, falls back to ALL incidents in case_store
-        (useful for `--report-only` mode).
-        Returns the report generator's result dict, or None if reporting
-        is unavailable / no case_store is open.
-        """
+      
         if not _REPORTING_AVAILABLE:
             print("  [WARN] Tier-5 reporting modules not available "
                   "(reporting/ package import failed)")
@@ -1099,8 +843,7 @@ class EIRPInferenceEngine:
             return None
 
         if incident_ids is None:
-            # Cover both net-new and merged incidents touched this run, deduped
-            # (a merged incident can appear multiple times within one run).
+           
             _touched = (self.last_lifecycle.get("incidents_created", [])
                         + self.last_lifecycle.get("incidents_merged", []))
             incident_ids = [iid for iid in dict.fromkeys(_touched)
@@ -1131,24 +874,8 @@ class EIRPInferenceEngine:
         return result
 
     def _run_incident_lifecycle(self, df_scored: pd.DataFrame) -> pd.DataFrame:
-        """
-        For every scored row, classify into INC-01..06 (or none). For each
-        row that classifies and is within the per-run cap:
-          1. create an incident row in the case_store
-          2. start a playbook execution and auto-complete any steps marked
-             `automated=True` (logs each completion to the playbook_execution
-             table for SLA accounting)
-          3. dispatch a severity-routed notification through the Notifier
-             (records intent in notifications_log when SMTP/Termii are stubs)
-
-        Adds these columns to df_scored:
-          incident_type, incident_name, playbook_id, incident_rationale
-                                                            (from classifier)
-          incident_id              persistent case-store id (or "" if not
-                                   persisted / not classified)
-          playbook_execution_id    in-memory execution id (or "" if not started)
-        """
-        # Reset per-run tracker
+       
+       
         self.last_lifecycle = {
             "incidents_created":             [],
             "incidents_merged":              [],
@@ -1170,7 +897,7 @@ class EIRPInferenceEngine:
             df_scored["playbook_execution_id"]= ""
             return df_scored
 
-        # Stage 1 -- classify every row
+      
         df_scored = self.incident_classifier.classify_batch(df_scored)
 
         incident_ids       = [""] * len(df_scored)
@@ -1178,8 +905,7 @@ class EIRPInferenceEngine:
         classified_mask    = df_scored["incident_type"].astype(str) != ""
         n_classified       = int(classified_mask.sum())
 
-        # Stages 2-4 require case store + playbook engine; if either missing,
-        # only the classification columns are added.
+       
         if (n_classified == 0
                 or self.case_store is None
                 or self.playbook_engine is None):
@@ -1188,22 +914,18 @@ class EIRPInferenceEngine:
             return df_scored
 
         persisted = 0
-        # Per-call diagnostic so the actual cap at the gate is visible
-        # in the Engine Terminal. If this prints "cap=1000" when the
-        # dashboard told you "unlimited", something downstream is
-        # silently re-setting self.max_incidents.
+      
         _cap_msg = "unlimited" if self.max_incidents <= 0 \
                                   else f"{self.max_incidents}"
         print(f"[engine.score] persist gate: cap={_cap_msg} "
               f"classified={int(classified_mask.sum())} "
               f"source={getattr(self, '_current_source_kind', '?')}",
               flush=True)
-        # iterrows over the classified subset preserves the original df index
+        
         for orig_idx, row in df_scored[classified_mask].iterrows():
             row_pos = df_scored.index.get_loc(orig_idx)
 
-            # max_incidents <= 0 means "unlimited" (persist every classified
-            # row). Positive values still cap.
+            
             if self.max_incidents > 0 and persisted >= self.max_incidents:
                 self.last_lifecycle["skipped_beyond_cap"] += 1
                 continue
@@ -1218,13 +940,7 @@ class EIRPInferenceEngine:
             att_tech    = str(row.get("attack_technique", "") or "")
             mb_label    = str(row.get("model_b_label", "") or "")
 
-            # Traceability bundle (Q#3): pin the incident to the exact event.
-            #   row_pos       -- positional row in the scored DataFrame (same
-            #                    index the source CSV used)
-            #   event_hash    -- prefer the parser's own `fingerprint` column
-            #                    (LIRA emits one); else a sha1 of canonical
-            #                    event fields per source kind
-            #   model_id      -- which supervised model won this row (0 = none)
+          
             event_hash = _canonical_event_hash(
                 row, getattr(self, "_current_source_kind", ""))
             try:
@@ -1232,14 +948,7 @@ class EIRPInferenceEngine:
             except (TypeError, ValueError):
                 model_id = 0
 
-            # Pick the per-row host identifier so the case-store can dedup
-            # (host, type, technique) into a single OPEN incident with an
-            # occurrence_count. Each parser uses a different column name --
-            # check the ones we know about, fall back to '' (no dedup).
-            #   LIRA  -> 'host'
-            #   EVTX  -> 'computer_name' (modern) or 'computer' (legacy)
-            #   ERROR -> 'host'
-            #   ACCESS -> 'client_ip'  (closest stable identifier per origin)
+            
             host_val = ""
             for _host_col in ("host", "computer_name", "computer",
                               "hostname", "client_ip", "src_host",
@@ -1282,10 +991,7 @@ class EIRPInferenceEngine:
                     rule_id             = str(row.get("rule_id", "") or ""),
                 )
                 incident_ids[row_pos] = inc_id
-                # Net-new vs merged: a "merged" status means this event was
-                # folded into an existing OPEN incident (occurrence_count++),
-                # not a brand-new case. Tracking them apart keeps per-source
-                # incident counts from inflating on every rescan.
+               
                 if _persist_status == "merged":
                     self.last_lifecycle["incidents_merged"].append(inc_id)
                 else:
@@ -1295,13 +1001,7 @@ class EIRPInferenceEngine:
                 incident_ids[row_pos] = f"error:{exc}"
                 continue
 
-            # Recurring (merged) events only escalate the existing incident's
-            # occurrence_count + ITS (handled inside create_incident). Running
-            # the full response stack -- playbook, notifications, evidence,
-            # recovery, BCP -- again for every recurrence is what ballooned
-            # playbook_execution / notifications_log into the hundreds of
-            # thousands of rows for a single incident. The stack runs ONCE,
-            # for the net-new event only.
+           
             if _persist_status == "merged":
                 continue
 
@@ -1337,7 +1037,7 @@ class EIRPInferenceEngine:
                 except Exception:
                     pass
 
-            # Stage 4 -- severity-routed notification
+           
             if self.notifier is not None:
                 try:
                     self.notifier.dispatch(
@@ -1351,11 +1051,7 @@ class EIRPInferenceEngine:
                 except Exception:
                     pass  # Notifier logs its own failures via case_store
 
-            # Stage 5 -- Tier-4 recovery + continuity
-            #   (a) containment advisory  -> audit_trail
-            #   (b) recovery checklist    -> evidence_chain (SHA-256-hashed text)
-            #   (c) BCP activation        -> bcp_output/ + audit_trail
-            #       Fires only on CRITICAL severity for INC-02/INC-03 by default
+           
             if self.containment_advisor is not None:
                 try:
                     actions = self.containment_advisor.recommend(inc_type, severity)
@@ -1413,28 +1109,12 @@ class EIRPInferenceEngine:
 
     def _persist_evtx_episodes(self, source_path: str,
                                 source_name: str) -> int:
-        """Promote EVTX attack episodes from the parser's episodes.csv
-        into the case store as standalone incidents.
-
-        WELA's `detect_episodes()` finds multi-event attack chains that the
-        per-event scoring pipeline misses entirely:
-          - BRUTE_FORCE_EPISODE  -- N failed logons from one IP within 60s
-          - SMB_ACCESS_STORM     -- N SMB denials from one IP within 60s
-          - CREDENTIAL_STUFFING  -- failed logons against N different
-                                    accounts from one IP within 5 minutes
-        These are written to `episodes.csv` in the same dispatch dir as
-        all_labeled_events.csv. We read that file, hash each row to dedupe
-        across re-scans (source_event_hash uniqueness), and persist each
-        new episode as INC-04 INSIDER_THREAT (security-team escalation).
-
-        Returns the number of NEW incidents persisted this call.
-        """
+       
         if self.case_store is None or not source_path:
             return 0
 
         sp = Path(source_path)
-        # Dispatch convention from parsers_runner._run_raw_parser:
-        # LIRA_dispatch/windows_evtx/<stem>/episodes.csv
+        
         ep_csv = (BASE_DIR / "LIRA_dispatch" / "windows_evtx"
                   / sp.stem / "episodes.csv")
         if not ep_csv.exists():
@@ -1469,8 +1149,7 @@ class EIRPInferenceEngine:
             if mapping is None:
                 continue
             inc_id, its_proxy, derived_sev = mapping
-            # Canonical hash: same episode in the same file should produce
-            # the same hash across re-scans so we can dedup.
+           
             canon = (f"{sp.name}|{ep.get('start_time','')}|"
                      f"{ep_type}|{ep.get('source','')}")
             ep_hash = _hashlib.sha1(canon.encode("utf-8")).hexdigest()[:16]
@@ -1485,9 +1164,7 @@ class EIRPInferenceEngine:
                        f"{ep.get('source','?')} @ {ep.get('start_time','')}: "
                        f"{ep.get('event_count','?')} events affecting "
                        f"{ep.get('affected_accounts','-')}")
-            # Episodes already span many events on a host, so the source
-            # field (which evtx_episode_detector fills with the
-            # computer/host name) is the dedup-host axis.
+         
             ep_host = str(ep.get("source", "") or "").strip()
             try:
                 inc_id_created = self.case_store.create_incident(
@@ -1525,41 +1202,14 @@ class EIRPInferenceEngine:
     def score(self, df: pd.DataFrame, source: str,
               source_name: str = "", source_path: str = "",
               source_csv_path: str = "") -> pd.DataFrame:
-        """
-        Score all events in `df` and return an enriched DataFrame.
-
-        Parameters
-        ----------
-        df          : input events
-        source      : inference source kind  ("lira" / "access" / "evtx"
-                       / "error"). Drives feature extraction routing.
-        source_name : user-friendly source label (e.g. "LIRA 2026") -- forwarded
-                       to case_store.create_incident() for attribution.
-        source_path : path the events came from -- also forwarded for audit.
-        source_csv_path : the EXACT parser-output CSV that `df` was read from.
-                       Persisted on each incident so the dashboard's detail
-                       view can reopen the precise row instead of guessing
-                       among stale sibling dispatch runs. Defaults to "" (the
-                       in-process live worker can't always supply it); the
-                       detail view then falls back to hash-validated discovery.
-
-        Columns added:
-          anomaly_score, is_anomaly, its_score, its_severity, its_action
-          supervised_label, supervised_confidence (if model available)
-        """
+       
         # Stash for use inside the incident-persistence loop further down.
         self._current_source_kind = source
         self._current_source_name = source_name
         self._current_source_path = source_path
         self._current_source_csv_path = source_csv_path
 
-        # ── Schema validation (Q#4): warn loudly if parser output drifted ───
-        # Catches the silent-zeroing class of bugs where a renamed/dropped
-        # parser column flows through extract_ces_features as a 0 feature
-        # and Model B sees a uniform input. Validation is observational --
-        # we proceed regardless so a stale parser doesn't take down scoring,
-        # but the result is stashed on the engine and logged so reports +
-        # dashboard can surface "predictions may be degraded".
+      
         self.last_validation = validate_source_schema(df, source)
         v = self.last_validation
         if v.get("unknown_source"):
@@ -1579,7 +1229,7 @@ class EIRPInferenceEngine:
 
         results = df.copy()
 
-        # ── Isolation Forest scoring ──────────────────────────────────────────
+        # ── Isolation Forest scoring 
         ces = extract_ces_features(df, source)
         X   = ces.values.astype(float)
 
@@ -1594,24 +1244,20 @@ class EIRPInferenceEngine:
             results["is_anomaly"]    = 0
 
         # ── Phase 2: Correlation + ATT&CK enrichment ──────────────────────────
-        # Runs BEFORE Model B + ITS so the resulting cor_fire_count feeds both
-        # the ThreatScorer (W_CORRELATION weight) and downstream incident
-        # persistence (attack_tactic / attack_technique on case_store rows).
-        # Single-source inference yields cor_fire_count=0 for most rules (they
-        # are cross-source by design) -- that is correct semantics.
+        
         if self.correlation_engine is not None and self.attack_mapper is not None:
             try:
                 phase2_df = self._prepare_phase2_input(df, source)
                 phase2_df = self.correlation_engine.evaluate(phase2_df)
                 phase2_df = self.attack_mapper.map(phase2_df)
-                # Carry the new columns over to results (preserving its index)
+                
                 for col in ("cor_rules_fired", "cor_fire_count",
                             "attack_tactic", "attack_technique",
                             "attack_label", "attack_all"):
                     if col in phase2_df.columns:
                         results[col] = phase2_df[col].reindex(results.index).fillna(
                             "" if phase2_df[col].dtype == object else 0).values
-                # Per-run summary captured for build_report()
+               
                 self.last_phase2["cor_total_fires"]   = int(
                     results["cor_fire_count"].sum())
                 self.last_phase2["cor_events_w_fire"] = int(
@@ -1639,8 +1285,7 @@ class EIRPInferenceEngine:
             results["attack_label"]     = ""
             results["attack_all"]       = ""
 
-        # ── Tier 2 Model B unified meta-classifier ────────────────────────────
-        # Cross-source classifier over 13 CES + anomaly_score -> 7 unified incident classes
+       
         if self.model_b is not None:
             X_b = np.column_stack([X, results["anomaly_score"].values])
             try:
@@ -1649,7 +1294,7 @@ class EIRPInferenceEngine:
                 if hasattr(self.model_b, "predict_proba"):
                     proba = self.model_b.predict_proba(X_b)
                     results["model_b_confidence"] = proba.max(axis=1)
-                    # Per-class probability columns (useful for operator threshold tuning)
+                    
                     for idx, cls in enumerate(self.model_b_encoder.classes_):
                         results[f"model_b_p_{cls}"] = proba[:, idx]
             except Exception as exc:
@@ -1659,14 +1304,10 @@ class EIRPInferenceEngine:
             results["model_b_label"]      = "not_loaded"
             results["model_b_confidence"] = 0.0
 
-        # ── ITS computation via ThreatScorer (architecture doc Section D4) ────
-        # Replaces the inline compute_its() block; uses cor_fire_count produced
-        # by the CorrelationEngine above. Falls back to the legacy inline
-        # computation if ThreatScorer failed to load.
+   
         if self.threat_scorer is not None:
             ts_in = results.copy()
-            # ThreatScorer needs severity_score (or severity_norm); synthesise
-            # one from anomaly_score if the parser didn't provide one.
+          
             if ("severity_score" not in ts_in.columns and
                     "severity_norm" not in ts_in.columns):
                 if "severity_weight" in ts_in.columns:
@@ -1675,7 +1316,7 @@ class EIRPInferenceEngine:
                         .fillna(0).clip(0, 1))
                 else:
                     ts_in["severity_norm"] = ts_in["anomaly_score"]
-            # Map after-hours-equivalent flag if `is_after_hours` is absent.
+            
             if "is_after_hours" not in ts_in.columns:
                 if "is_off_hours" in ts_in.columns:
                     ts_in["is_after_hours"] = pd.to_numeric(
@@ -1695,12 +1336,11 @@ class EIRPInferenceEngine:
                 self.last_phase2["its_summary"] = ThreatScorer.summarise(scored)
             except Exception as exc:
                 self.last_phase2["threat_scorer_error"] = str(exc)
-                # Fall through to legacy below
+               
                 self.threat_scorer = None
 
         if self.threat_scorer is None:
-            # Legacy inline ITS (kept as fallback for offline test environments
-            # missing ml_threat_scorer.py)
+           
             if "severity_score" in df.columns:
                 sev_raw  = pd.to_numeric(df["severity_score"], errors="coerce").fillna(0)
                 sev_norm = (sev_raw / sev_raw.max()).clip(0, 1) if sev_raw.max() > 0 else sev_raw
@@ -1733,14 +1373,7 @@ class EIRPInferenceEngine:
             results["its_severity"] = [l[0] for l in its_labels]
             results["its_action"]   = [l[1] for l in its_labels]
 
-        # ── Tier 3 Response Engine (Model C) -- rule-based action decisions ──
-        # Requires Model B output for class lookup + ITS severity for matrix
-        # column. Engine emits per-event:
-        #   response_actions                   pipe-joined primary action list
-        #   response_confirm_required          bool, destructive actions queued
-        #   response_actions_pending_confirm   pipe-joined held actions
-        #   response_downgraded                bool, safety / confidence overlay
-        #   response_rationale                 trace string for audit log
+      
         if self.response_engine is not None and self.model_b is not None:
             # Attach CES temporal columns required by ResponseEngine.decide_batch
             results["ces_hour"]          = ces["ces_hour"].values
@@ -1754,18 +1387,7 @@ class EIRPInferenceEngine:
                 results["response_downgraded"] = False
                 results["response_rationale"] = f"engine error: {exc}"
 
-        # ── Supervised model prediction (Tier 2 routing) ─────────────────────
-        # Each model that matches the source AND whose eligibility predicate
-        # (MODEL_ELIGIBILITY) selects at least one row gets to score its
-        # subset. Per-model results land in dedicated m{id}_label /
-        # m{id}_confidence columns; a row may carry verdicts from 0, 1, or N
-        # models. The legacy supervised_label column is preserved for
-        # backward-compat -- it holds the highest-confidence pick per row,
-        # with supervised_model_id naming the winning model.
-        #
-        # Runs BEFORE _run_incident_lifecycle so the supervised_model_id
-        # column is available when each persisted incident records which
-        # model produced its verdict (Q#3 traceability).
+     
         per_model_runs: list = []     # [(mid, mask, preds, conf_arr)]
         eligible_for_source = [(mid, m) for mid, m in self.supervised.items()
                                if m["info"]["source"] == source]
@@ -1777,7 +1399,7 @@ class EIRPInferenceEngine:
                         else pd.Series(True, index=df.index))
             except Exception:
                 mask = pd.Series(False, index=df.index)
-            # Seed empty columns so downstream code can always read them.
+            
             results[f"m{mid}_label"]      = ""
             results[f"m{mid}_confidence"] = 0.0
             if not bool(mask.any()):
@@ -1799,19 +1421,14 @@ class EIRPInferenceEngine:
                 else:
                     conf = np.zeros(len(sub_df), dtype=float)
             except Exception as exc:
-                # Record the error per-row in the m{id}_label so callers
-                # can see WHICH model failed (vs swallowing into a single
-                # supervised_label as the old code did).
+                
                 results.loc[mask, f"m{mid}_label"] = f"error: {exc}"
                 continue
             results.loc[mask, f"m{mid}_label"]      = preds
             results.loc[mask, f"m{mid}_confidence"] = conf
             per_model_runs.append((mid, mask, preds, conf))
 
-        # Backward-compat: collapse per-model results into a single
-        # supervised_label/_confidence by picking the highest-confidence
-        # verdict per row. supervised_model_id names the winning model
-        # (0 = no model scored this row).
+      
         results["supervised_label"]      = ""
         results["supervised_confidence"] = 0.0
         results["supervised_model_id"]   = 0
@@ -1834,20 +1451,10 @@ class EIRPInferenceEngine:
         elif not eligible_for_source:
             results["supervised_label"] = "model_not_trained"
 
-        # ── Tier 3+ incident lifecycle ────────────────────────────────────────
-        # classify -> persist (case_store) -> start playbook -> dispatch notifier
-        # Adds: incident_type, incident_name, playbook_id, incident_rationale,
-        #       incident_id, playbook_execution_id
-        # Reads supervised_model_id set above so persisted incidents carry
-        # the winning model's id (Q#3 traceability).
+        
         results = self._run_incident_lifecycle(results)
 
-        # ── EVTX episode promotion ────────────────────────────────────────────
-        # WELA detects multi-event attack chains (BRUTE_FORCE_EPISODE,
-        # SMB_ACCESS_STORM, CREDENTIAL_STUFFING) that the per-event
-        # pipeline doesn't see -- each episode IS a security incident
-        # already. Read episodes.csv from the dispatch dir and persist
-        # one INC-04 per new episode (dedup by source_event_hash).
+      
         if source == "evtx" and source_path:
             try:
                 self._persist_evtx_episodes(source_path, source_name)
@@ -1857,16 +1464,10 @@ class EIRPInferenceEngine:
         return results
 
 
-# =============================================================================
-# SECTION 7 — REPORT GENERATION
-# =============================================================================
 
 def build_report(df_scored: pd.DataFrame, source: str,
                  input_path: str, engine: EIRPInferenceEngine) -> dict:
-    """
-    Build the JSON validation report from a scored DataFrame.
-    Designed to be sent back to the researcher from remote sites.
-    """
+   
     its      = df_scored["its_score"]
     severity = df_scored["its_severity"].value_counts().to_dict()
     anomalies= int(df_scored["is_anomaly"].sum())
@@ -1896,7 +1497,7 @@ def build_report(df_scored: pd.DataFrame, source: str,
                 r[col] = str(row[col])
         top_rows.append(r)
 
-    # Model B unified incident-class distribution (cross-source)
+    
     model_b_dist = {}
     if "model_b_label" in df_scored.columns:
         valid = df_scored["model_b_label"].astype(str)
@@ -1904,7 +1505,7 @@ def build_report(df_scored: pd.DataFrame, source: str,
         if len(valid):
             model_b_dist = {k: int(v) for k, v in valid.value_counts().items()}
 
-    # Tier 3 Model C response action distribution
+   
     response_dist = {}
     response_summary = {}
     if "response_actions" in df_scored.columns:
@@ -1923,7 +1524,7 @@ def build_report(df_scored: pd.DataFrame, source: str,
                 "mean_actions_per_event": round(len(all_actions) / max(len(df_scored), 1), 2),
             }
 
-    # Tier 3+ incident lifecycle summary (classifier + playbook + case store + notifier)
+   
     incident_lifecycle = {}
     if "incident_type" in df_scored.columns:
         inc_types_all = df_scored["incident_type"].astype(str)
@@ -1934,7 +1535,7 @@ def build_report(df_scored: pd.DataFrame, source: str,
         persisted_ids = inc_ids[(inc_ids != "") & (~inc_ids.str.startswith("error:"))]
 
         lc = engine.last_lifecycle
-        # Severity distribution among classified events
+       
         inc_severity = {}
         if "its_severity" in df_scored.columns:
             sev_series = df_scored.loc[inc_types_all != "", "its_severity"].astype(str)
@@ -1965,7 +1566,7 @@ def build_report(df_scored: pd.DataFrame, source: str,
             "n_bcp_activations":            len(lc["bcp_activations"]),
         }
 
-    # Add lifecycle fields to top-incident rows when present
+   
     if "incident_type" in df_scored.columns:
         for r, (_, row) in zip(top_rows, top_incidents.iterrows()):
             inc_type = str(row.get("incident_type", ""))
@@ -2159,57 +1760,6 @@ def print_console_report(report: dict, df_scored: pd.DataFrame) -> None:
     print(f"\n{'='*W}\n")
 
 
-# =============================================================================
-# SECTION 8 — DEMO MODE
-# =============================================================================
-
-def run_demo(engine: EIRPInferenceEngine) -> None:
-    """
-    Demonstration mode: load a sample from ML_Datasets/ and score it.
-    Requires only models/isolation_forest.pkl (no training scripts needed).
-    """
-    print("\n  [DEMO] Running on saved ML_Datasets sample...")
-
-    # Try each source in priority order
-    demo_sources = [
-        ("lira",   DATASETS_DIR / "model_01_db_downtime_classifier" / "X_test.pkl",
-                   DATASETS_DIR / "model_01_db_downtime_classifier" / "label_encoder.pkl",
-                   DATASETS_DIR / "model_01_db_downtime_classifier" / "metadata.json"),
-        ("access", DATASETS_DIR / "model_04_web_traffic_anomaly_classifier" / "X_test.pkl",
-                   DATASETS_DIR / "model_04_web_traffic_anomaly_classifier" / "label_encoder.pkl",
-                   DATASETS_DIR / "model_04_web_traffic_anomaly_classifier" / "metadata.json"),
-    ]
-
-    for source, X_path, le_path, meta_path in demo_sources:
-        if X_path.exists() and meta_path.exists():
-            X_test  = joblib.load(X_path)
-            meta    = json.loads(meta_path.read_text())
-            feat_names = meta.get("feature_names", [f"f{i}" for i in range(X_test.shape[1])])
-
-            # Reconstruct a DataFrame from the saved numpy array
-            df_demo = pd.DataFrame(X_test, columns=feat_names)
-            # Add synthetic columns the scorer needs
-            if source == "lira" and "severity_score" not in df_demo.columns:
-                df_demo["severity_score"] = df_demo.get("severity_score",
-                    pd.Series(np.random.uniform(0,10,len(df_demo))))
-
-            print(f"  [DEMO] Source: {source.upper()} | {len(df_demo):,} test events")
-            df_scored = engine.score(df_demo, source)
-            report    = build_report(df_scored, source, "DEMO_ML_Datasets", engine)
-            print_console_report(report, df_scored)
-
-            out = BASE_DIR / f"eirp_demo_report_{datetime.now():%Y%m%d_%H%M%S}.json"
-            out.write_text(json.dumps(report, indent=2, default=str))
-            print(f"  [SAVED] Demo report -> {out.name}")
-            return
-
-    print("  [WARN] No ML_Datasets found. Run ml_dataset_builder.py first.")
-
-
-# =============================================================================
-# SECTION 9 — CLI ENTRY POINT
-# =============================================================================
-
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -2298,8 +1848,7 @@ def main():
         bcp_critical_only        = not args.bcp_any_severity,
     )
 
-    # --report-only short-circuits inference: generate reports for whatever
-    # is already in the case_store and exit.
+   
     if args.report_only:
         print("\n  Generating Tier-5 reports from existing case_store...")
         result = engine.generate_reports(

@@ -26,10 +26,6 @@ from datetime import datetime
 from collections import Counter
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# TOOL METADATA
-# ═══════════════════════════════════════════════════════════════════════
-
 TOOL_NAME    = "LIRA — 2024 Dedicated Log Parser"
 TOOL_VERSION = "1.0"
 YEAR         = "2024"
@@ -38,22 +34,17 @@ PRIMARY_DB   = "bamed"
 
 SEVERITY_WEIGHT = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
 
-# Working hours
+
 WORK_START = 7
 WORK_END   = 21
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# 2024 CONFIRMED BASELINE
-# Derived from complete scan of log_031214_2024.txt.
-# Total connection events ~70,000. Threshold: >= 1% = >= 700 connections.
-# ═══════════════════════════════════════════════════════════════════════
 
 BASELINE_USERS_2024 = {"root3"}
 
 SUSPICIOUS_USERS_2024 = {"basoft"}
 
-# Hosts with >= 700 connections in 2024
+
 BASELINE_HOSTS_2024 = {
     "Emergency-Phamarcy",   # 9,813
     "DESKTOP-VLAGG25",      # 5,355
@@ -129,9 +120,6 @@ RAW_IP_HOSTS_2024 = {
 }
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# REGEX PATTERNS
-# ═══════════════════════════════════════════════════════════════════════
 
 RE_MAIN = re.compile(
     r'^(?P<date>\d{4}-\d{2}-\d{2})\s+'
@@ -161,13 +149,9 @@ RE_IPV4  = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
 RE_IPV6  = re.compile(r'^fe80::')
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# RULE CATALOG — 2024 EDITION
-# Includes all 2023 rules + 3 new rules from 2024-specific patterns
-# ═══════════════════════════════════════════════════════════════════════
 
 RULE_CATALOG = {
-    # ── Downtime / Availability ──────────────────────────────────────
+   
     "R01":  "InnoDB crash recovery initiated",
     "R02":  "Aria engine crash recovery initiated",
     "R03":  "Database service restarted — now online",
@@ -176,16 +160,16 @@ RULE_CATALOG = {
     "R06":  "Shutdown sub-sequence event",
     "R26":  "Too many connections — DB connection limit exhausted",
     "R27":  "Table cache mutex contention — performance degradation",
-    # ── Data Corruption (context-dependent) ─────────────────────────
+   
     "R07":  "Temp tablespace recreated — crash context only",
     "R08":  "Stale temp file removed — crash context only",
     "R09":  "Rollback segments activated — crash context only",
-    # ── Critical Infrastructure Failures ────────────────────────────
+  
     "R28":  "InnoDB ibdata1 not writable — critical storage failure",
     "R29":  "InnoDB LSN mismatch — data integrity at risk",
     "R30":  "InnoDB/plugin storage engine failure — service unable to start",
     "R31":  "Database emergency abort — unrecoverable failure",
-    # ── Unauthorized Access ──────────────────────────────────────────
+   
     "R10":  "Unauthenticated connection from real host — auth never completed",
     "R11":  "Access denied — unknown user basoft [CRITICAL]",
     "R11B": "Access denied — root3 from DUFUTH-SERVER [ANOMALY]",
@@ -197,10 +181,10 @@ RULE_CATALOG = {
     "R17":  "Aborted connection from baseline host — benign",
     "R18":  "After-hours aborted connection from baseline host",
     "R19":  "DNS resolution failure or hostname mismatch",
-    # ── 2024 New Abort Reason Rules ──────────────────────────────────
+   
     "R32":  "Aborted — Unknown error (anomalous connection termination)",
     "R33":  "Aborted — Query execution was interrupted",
-    # ── Benign Operational ───────────────────────────────────────────
+   
     "R21":  "InnoDB buffer pool management — benign",
     "R22":  "Plugin or extension status event — benign",
     "R23":  "Startup / replication / config event — benign",
@@ -209,24 +193,9 @@ RULE_CATALOG = {
 }
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# PASS 1b — STARTUP CONTEXT ASSIGNMENT
-#
-# 2024-specific addition: abort_startup context
-#
-# Three session types in 2024:
-#   crash_startup  : started, had crash recovery, reached ready for connections
-#   clean_startup  : started after clean shutdown, reached ready for connections
-#   abort_startup  : started but hit ERROR/Aborting before ready for connections
-#                   (2024-03-22 catastrophe is the only abort_startup in 2024)
-#   running        : event occurred while DB was actively serving connections
-#
-# R07/R08/R09 only fire as DATA_CORRUPTION in crash_startup sessions.
-# In clean_startup and abort_startup they are BENIGN (or not present).
-# ═══════════════════════════════════════════════════════════════════════
 
 def assign_startup_context(events: list) -> list:
-    """Assign startup_context and startup_session_id to every event."""
+
     for e in events:
         e["startup_context"]    = "running"
         e["startup_session_id"] = 0
@@ -305,16 +274,9 @@ def assign_startup_context(events: list) -> list:
     return events
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# PASS 1 — PARSER
-# Reads every line and extracts all sub-fields.
-# No whitespace-padded lines in 2024 (confirmed from file scan).
-# ═══════════════════════════════════════════════════════════════════════
 
 def parse_log(filepath: str) -> tuple:
-    """
-    Returns: (events, raw_line_count, skipped_lines, file_size_bytes)
-    """
+  
     events    = []
     raw_lines = 0
     skipped   = 0
@@ -366,7 +328,7 @@ def parse_log(filepath: str) -> tuple:
                     dow = mon = ""
                     yr = ""
 
-                # ── Aborted connection sub-fields ─────────────────────
+               
                 user = db = host = conn_id = abort_reason = ""
                 ab = RE_ABORTED.search(message)
                 if ab:
@@ -376,7 +338,7 @@ def parse_log(filepath: str) -> tuple:
                     host         = ab.group("host")
                     abort_reason = ab.group("reason").strip()
 
-                # ── Access denied sub-fields ──────────────────────────
+                
                 ad_user = ad_host = ad_pwd = ""
                 ad = RE_ACCESS_DENIED.search(message)
                 if ad:
@@ -388,27 +350,27 @@ def parse_log(filepath: str) -> tuple:
                     if not host:
                         host = ad_host
 
-                # ── DNS failure ───────────────────────────────────────
+                #
                 dns_m      = RE_DNS.search(message)
                 dns_entity = dns_m.group("entity") if dns_m else ""
 
-                # ── LSN ───────────────────────────────────────────────
+                
                 lsn_m = RE_LSN.search(message)
                 lsn   = lsn_m.group(1) if lsn_m else ""
 
-                # ── After-hours flag ──────────────────────────────────
+                
                 is_aft = (
                     "1" if (hour != -1 and
                            (hour < WORK_START or hour > WORK_END))
                     else "0"
                 )
 
-                # ── Fingerprint ───────────────────────────────────────
+                
                 fp = hashlib.sha256(
                     f"{ts_str}|{m.group('thread')}|{message[:100]}".encode()
                 ).hexdigest()[:16]
 
-                # ── Host classification ───────────────────────────────
+                
                 if not host or host == "__empty__":
                     hc = "no_host"
                 elif RE_IPV6.match(host):
@@ -426,7 +388,7 @@ def parse_log(filepath: str) -> tuple:
                 else:
                     hc = "non_baseline_unknown"
 
-                # ── User classification ───────────────────────────────
+                
                 raw_user = ad_user if ad else user
                 if not raw_user or raw_user == "__empty__":
                     uc = "anonymous"
@@ -513,11 +475,7 @@ def parse_log(filepath: str) -> tuple:
     return events, raw_lines, skipped, file_size
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# PASS 2 — LABELING ENGINE
-# All rules verified against actual 2024 log patterns.
-# Rule ordering is critical — more specific rules come first.
-# ═══════════════════════════════════════════════════════════════════════
+
 
 def label_event(event: dict) -> dict:
     """Apply 2024 labeling rules. Every decision is traceable by Rule ID."""
@@ -545,11 +503,6 @@ def label_event(event: dict) -> dict:
     confidence = "HIGH"
     notes      = ""
 
-    # ══════════════════════════════════════════════════════════════════
-    # BLOCK 0 — CRITICAL INFRASTRUCTURE FAILURES (ERROR level)
-    # Must be checked FIRST — ERROR level events only appear in
-    # the 2024-03-22 catastrophe sequence. Handle before all other rules.
-    # ══════════════════════════════════════════════════════════════════
 
     if level == "ERROR" and "innodb_system data file" in msg and "writable" in msg:
         label    = "DATA_CORRUPTION"
@@ -617,9 +570,7 @@ def label_event(event: dict) -> dict:
             "Date: 2024-03-22 13:19:28."
         )
 
-    # ══════════════════════════════════════════════════════════════════
-    # BLOCK A — SYSTEM DOWNTIME
-    # ══════════════════════════════════════════════════════════════════
+
 
     elif "innodb: starting crash recovery" in msg:
         label    = "SYSTEM_DOWNTIME"
@@ -679,12 +630,10 @@ def label_event(event: dict) -> dict:
         models   = ["downtime_events"]
         notes    = "Part of authorized shutdown sub-sequence. Benign."
 
-    # ── Too many connections — BEFORE general unauthenticated check ───
+
     elif (hc == "connecting_host_system" and
           "too many connections" in ar):
-        # R26: host='connecting host', user='unauthenticated', db='unconnected'
-        # MariaDB uses this sentinel hostname when it cannot resolve
-        # the hostname before rejecting the connection due to limit.
+       
         label    = "SYSTEM_DOWNTIME"
         sublabel = "connection_limit_exhausted_availability_incident"
         severity = "HIGH"
@@ -698,7 +647,6 @@ def label_event(event: dict) -> dict:
             "primarily in Feb-Mar 2024. Partial EMR unavailability."
         )
 
-    # ── Table cache mutex contention (NOTE level in 2024) ─────────────
     elif "table cache mutex contention" in msg:
         label    = "SYSTEM_DOWNTIME"
         sublabel = "table_cache_mutex_contention_performance_degradation"
@@ -712,10 +660,7 @@ def label_event(event: dict) -> dict:
             "April 2024. table_open_cache is undersized for 2024 load."
         )
 
-    # ══════════════════════════════════════════════════════════════════
-    # BLOCK B — DATA CORRUPTION (context-dependent)
-    # ══════════════════════════════════════════════════════════════════
-
+  
     elif "creating shared tablespace for temporary tables" in msg:
         if ctx == "crash_startup":
             label    = "DATA_CORRUPTION"
@@ -773,19 +718,13 @@ def label_event(event: dict) -> dict:
             rule_id  = "R23"
             notes    = "Normal InnoDB startup. No data integrity risk."
 
-    # ══════════════════════════════════════════════════════════════════
-    # BLOCK C — UNAUTHORIZED ACCESS
-    # Order matters: most specific checks first.
-    # ══════════════════════════════════════════════════════════════════
+
 
     elif (event["is_access_denied"] == "1" and
           ad_pwd == "NO" and
           (not ad_u or ad_u == "__empty__") and
           ad_h == "DUFUTH-SERVER"):
-        # R11C: Empty username, no password from DUFUTH-SERVER.
-        # New in 2024. 9 events. This is an anonymous connection probe —
-        # DUFUTH is attempting to connect with no credentials at all.
-        # Distinct from root3 (wrong password) and basoft (unknown user).
+       
         label    = "UNAUTHORIZED_ACCESS"
         sublabel = "anonymous_no_password_probe_dufuth_server"
         severity = "HIGH"
@@ -1044,10 +983,7 @@ def label_event(event: dict) -> dict:
         rule_id  = "R24"
         notes    = "Internal system connection. Benign."
 
-    # ══════════════════════════════════════════════════════════════════
-    # BLOCK D — BENIGN OPERATIONAL
-    # ══════════════════════════════════════════════════════════════════
-
+ 
     elif "buffer pool" in msg:
         label    = "BENIGN"
         sublabel = "innodb_buffer_pool_management"
@@ -1128,9 +1064,6 @@ def label_event(event: dict) -> dict:
     return event
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# DOWNTIME SESSION BUILDER
-# ═══════════════════════════════════════════════════════════════════════
 
 def build_sessions(events: list) -> list:
     sessions   = []
@@ -1179,9 +1112,6 @@ def build_sessions(events: list) -> list:
     return sessions
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# FILE UTILITIES
-# ═══════════════════════════════════════════════════════════════════════
 
 def write_csv(data: list, path: str) -> dict:
     if not data:
@@ -1205,560 +1135,4 @@ def hs(b: int) -> str:
     return f"{b:,} bytes"
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# REPORT GENERATOR
-# ═══════════════════════════════════════════════════════════════════════
 
-def generate_report(events, sessions, input_path, file_size,
-                    raw_lines, skipped, out_files, out_dir, start_dt):
-
-    end_dt   = datetime.now()
-    elapsed  = (end_dt - start_dt).total_seconds()
-    total    = len(events)
-    W        = 70
-
-    if total == 0:
-        return "ERROR: No events parsed."
-
-    label_ctr   = Counter(e["label"]        for e in events)
-    sev_ctr     = Counter(e["severity"]     for e in events)
-    rule_ctr    = Counter(e["rule_id"]      for e in events)
-    host_ctr    = Counter(e["host"]         for e in events if e["host"])
-    user_ctr    = Counter(e["user"]         for e in events if e["user"])
-    hour_ctr    = Counter(e["hour"]         for e in events if e["hour"] != -1)
-    dow_ctr     = Counter(e["day_of_week"]  for e in events if e["day_of_week"])
-    month_ctr   = Counter(e["month"]        for e in events if e["month"])
-    sublabel_ctr= Counter(e["sublabel"]     for e in events)
-    abort_ctr   = Counter(e["abort_reason"] for e in events if e["abort_reason"])
-    ctx_ctr     = Counter(e["startup_context"] for e in events)
-    ad_user_ctr = Counter(e["ad_user"]      for e in events if e["ad_user"])
-    ad_host_ctr = Counter(e["ad_host"]      for e in events if e["ad_host"])
-    db_ctr      = Counter(e["database"]     for e in events if e["database"])
-
-    incidents    = [e for e in events if e["is_incident"] == "1"]
-    access_denied= [e for e in events if e["is_access_denied"] == "1"]
-    unauth       = [e for e in events if e["rule_id"] in ("R10","R13")]
-    ipv6_evts    = [e for e in events if e["host_class"] == "ipv6_unregistered"]
-    dns_evts     = [e for e in events if e["dns_failure"] == "1"]
-    error_evts   = [e for e in events if e["level"] == "ERROR"]
-    after_h_inc  = [e for e in incidents if e["is_after_hours"] == "1"]
-    r26_evts     = [e for e in events if e["rule_id"] == "R26"]
-
-    if sessions:
-        durs         = [s["downtime_seconds"] for s in sessions]
-        total_down_s = sum(durs)
-        avg_down_m   = round(total_down_s / len(durs) / 60, 2)
-        max_down_m   = round(max(durs) / 60, 2)
-        min_down_m   = round(min(durs) / 60, 2)
-        total_down_h = round(total_down_s / 3600, 2)
-        after_h_crash= sum(1 for s in sessions if s["is_after_hours"] == "1")
-    else:
-        total_down_s = avg_down_m = max_down_m = min_down_m = 0
-        total_down_h = after_h_crash = 0
-
-    lines = []
-    def L(s=""): lines.append(s)
-    def SEP():  L("═" * W)
-    def sep2(): L("─" * W)
-    def H(t):
-        L()
-        sep2()
-        L(f"  {t}")
-        sep2()
-    def I(t): L(f"    {t}")
-
-    # ── COVER ─────────────────────────────────────────────────────────
-    SEP()
-    L(f"{'LIRA — 2024 Dedicated Log Parser Report':^{W}}")
-    L(f"{'PhD Research — ESUTH EMR Incident Response Plan':^{W}}")
-    SEP()
-    I(f"Hospital         : {HOSPITAL}")
-    I(f"Log File         : {os.path.basename(input_path)}")
-    I(f"Year Covered     : 2024 (full year — 2024-01-01 to 2024-12-31)")
-    I(f"File Size        : {hs(file_size)}")
-    I(f"Report Generated : {end_dt.strftime('%A, %d %B %Y at %H:%M:%S')}")
-    I(f"Processing Time  : {elapsed:.2f} seconds")
-    I(f"Output Directory : {os.path.abspath(out_dir)}")
-    SEP()
-
-    # ── SECTION 1: SOURCE FILE METRICS ────────────────────────────────
-    H("SECTION 1 — SOURCE FILE METRICS")
-    L()
-    I(f"Input File Name              : {os.path.basename(input_path)}")
-    I(f"Input File Size              : {hs(file_size)}")
-    I(f"Total Raw Lines in File      : {raw_lines:,} lines")
-    I(f"Skipped / Non-event Lines    : {skipped:,} lines")
-    I(f"Net Parseable Event Lines    : {raw_lines - skipped:,} lines")
-    I(f"Total Events Extracted       : {total:,} events")
-    I(f"Parser Efficiency            : {total/(raw_lines or 1)*100:.1f}%")
-    L()
-    dates = sorted(set(e["date"] for e in events if e["date"]))
-    if dates:
-        I(f"Earliest Event : {dates[0]}")
-        I(f"Latest Event   : {dates[-1]}")
-        I(f"Calendar Days  : {len(dates):,}")
-    L()
-    I("Events by Month (2024):")
-    month_order = ["January","February","March","April","May","June",
-                   "July","August","September","October","November","December"]
-    for mo in month_order:
-        if mo in month_ctr:
-            pct = month_ctr[mo] / total * 100
-            bar = "▓" * min(30, int(pct / 1.5))
-            I(f"  {mo:<12}: {month_ctr[mo]:>6,}  ({pct:5.1f}%)  {bar}")
-    L()
-    I("Log Level Distribution:")
-    for lv in ["Note","Warning","ERROR"]:
-        cnt = sum(1 for e in events if e["level"] == lv)
-        flag = "  *** FIRST TIME IN 2024 ***" if lv == "ERROR" and cnt > 0 else ""
-        I(f"  {lv:<10}: {cnt:>6,} events  ({cnt/total*100:5.1f}%){flag}")
-    L()
-    I("Startup Session Context Summary:")
-    for ctx, cnt in ctx_ctr.most_common():
-        I(f"  {ctx:<25}: {cnt:>7,} events")
-    I(f"  (abort_startup context = 2024-03-22 catastrophe sequence)")
-    L()
-    I("Databases Accessed:")
-    for db, cnt in db_ctr.most_common():
-        flag = "  *** PRIMARY EMR DB ***" if db == PRIMARY_DB else (
-               "  *** ANOMALOUS — secondary DB ***" if db not in ("unconnected","") else "")
-        I(f"  '{db}' : {cnt:,} connections{flag}")
-
-    # ── SECTION 2: OUTPUT FILE INVENTORY ──────────────────────────────
-    H("SECTION 2 — OUTPUT FILES PRODUCED")
-    L()
-    total_csv_bytes = 0
-    file_desc = {
-        "LIRA_2024_00_master_all_events.csv":         "All 2024 events, fully structured and labeled",
-        "LIRA_2024_01_incidents_only.csv":            "Non-benign events only — 2024 threat landscape",
-        "LIRA_2024_02_model_downtime_events.csv":     "Downtime model — event level (crash + planned)",
-        "LIRA_2024_03_model_downtime_sessions.csv":   "Downtime model — session level (ML-ready)",
-        "LIRA_2024_04_model_data_corruption.csv":     "Data corruption risk events",
-        "LIRA_2024_05_model_unauthorized_access.csv": "Unauthorized access events",
-        "LIRA_2024_06_model_suspicious_review.csv":   "Manual IT admin review queue",
-        "LIRA_2024_07_label_audit_trail.csv":         "Full labeling audit — thesis evidence",
-    }
-    I(f"  {'FILE':<46} {'ROWS':>8}  {'SIZE':>20}")
-    I(f"  {'─'*46} {'─'*8}  {'─'*20}")
-    I(f"  {'[SOURCE] ' + os.path.basename(input_path):<46} "
-      f"{raw_lines:>8,}  {hs(file_size):>20}")
-    I(f"  {'─'*46} {'─'*8}  {'─'*20}")
-    tot_rows = 0
-    for fname, desc in file_desc.items():
-        fm   = out_files.get(fname, {})
-        rows = fm.get("rows", 0)
-        sz   = fm.get("size", 0)
-        tot_rows += rows
-        total_csv_bytes += sz
-        I(f"  {fname:<46} {rows:>8,}  {hs(sz):>20}")
-        I(f"    {desc}")
-    I(f"  {'─'*46} {'─'*8}  {'─'*20}")
-    I(f"  {'TOTAL CSV OUTPUT':<46} {tot_rows:>8,}  {hs(total_csv_bytes):>20}")
-
-    # ── SECTION 3: LABEL DISTRIBUTION ─────────────────────────────────
-    H("SECTION 3 — INCIDENT LABEL DISTRIBUTION")
-    L()
-    I(f"  {'LABEL':<28} {'COUNT':>8}  {'%':>7}  BAR")
-    I(f"  {'─'*28} {'─'*8}  {'─'*7}  {'─'*20}")
-    for lb in ["BENIGN","SYSTEM_DOWNTIME","DATA_CORRUPTION",
-               "UNAUTHORIZED_ACCESS","SUSPICIOUS","PLANNED_MAINTENANCE"]:
-        cnt = label_ctr.get(lb, 0)
-        pct = cnt / total * 100
-        bar = "||" * int(pct / 2.5)
-        I(f"  {lb:<28} {cnt:>8,}  {pct:>6.2f}%  {bar}")
-    L()
-    I(f"Total incident events : {len(incidents):,}  ({len(incidents)/total*100:.2f}%)")
-    I(f"Total benign events   : {total-len(incidents):,}  ({(total-len(incidents))/total*100:.2f}%)")
-    L()
-    I("Sub-label breakdown (Top 15):")
-    I(f"  {'SUBLABEL':<50} {'COUNT':>8}")
-    I(f"  {'─'*50} {'─'*8}")
-    for sl, cnt in sublabel_ctr.most_common(15):
-        I(f"  {sl:<50} {cnt:>8,}")
-
-    # ── SECTION 4: SEVERITY ────────────────────────────────────────────
-    H("SECTION 4 — SEVERITY DISTRIBUTION")
-    L()
-    I(f"  {'SEVERITY':<12} {'COUNT':>8}  {'%':>7}  BAR")
-    I(f"  {'─'*12} {'─'*8}  {'─'*7}  {'─'*20}")
-    for sv in ["CRITICAL","HIGH","MEDIUM","LOW","INFO"]:
-        cnt = sev_ctr.get(sv, 0)
-        pct = cnt / total * 100
-        bar = "||" * int(pct / 2.5)
-        I(f"  {sv:<12} {cnt:>8,}  {pct:>6.2f}%  {bar}")
-    L()
-    crit_high = sev_ctr.get("CRITICAL",0) + sev_ctr.get("HIGH",0)
-    I(f"CRITICAL + HIGH : {crit_high:,} events requiring immediate IRP response")
-
-    # ── SECTION 5: DOWNTIME ANALYSIS ──────────────────────────────────
-    H("SECTION 5 — SYSTEM DOWNTIME ANALYSIS (2024 Metrics)")
-    L()
-    I(f"Crash sessions (downtime incidents) : {len(sessions):,}")
-    I(f"Total cumulative downtime           : {total_down_h:.2f} hours  ({total_down_s:,} seconds)")
-    I(f"Mean Time To Recovery (MTTR)        : {avg_down_m:.2f} minutes")
-    I(f"Longest single session              : {max_down_m:.2f} minutes")
-    I(f"Shortest single session             : {min_down_m:.2f} minutes")
-    I(f"After-hours crashes                 : {after_h_crash:,}")
-    I(f"Too-many-connections events (R26)   : {len(r26_evts):,}")
-    L()
-    I("2024-SPECIFIC: Catastrophe Sequence (2024-03-22 13:19:28)")
-    I("  R28 → R30 → R30 → R30 → R31  (ibdata1 not writable → abort)")
-    error_cnt = sum(1 for e in events if e["level"] == "ERROR")
-    I(f"  {error_cnt} ERROR-level events — first ERROR-level events in dataset")
-    I("  This session has abort_startup context (never reached ready for connections)")
-    L()
-    if sessions:
-        I("Top 5 Longest Downtime Sessions:")
-        I(f"  {'CRASH START':<22}  {'RECOVERY':<22}  {'DURATION':>10}")
-        I(f"  {'─'*22}  {'─'*22}  {'─'*10}")
-        for s in sorted(sessions, key=lambda x: -x["downtime_seconds"])[:5]:
-            I(f"  {s['crash_start_timestamp']:<22}  "
-              f"{s['recovery_timestamp']:<22}  {s['downtime_minutes']:>8.2f}m")
-
-    # ── SECTION 6: SECURITY FINDINGS ──────────────────────────────────
-    H("SECTION 6 — SECURITY FINDINGS (2024 Evidence)")
-    L()
-
-    # Finding 1
-    I("FINDING 1 — Single Shared DB User [CRITICAL]")
-    sep2()
-    I(f"  All 2024 workstations connect as 'root3' ({user_ctr.get('root3',0):,} events)")
-    I("  No individual user accountability at database layer.")
-    L()
-
-    # Finding 2 — Access Denied
-    I(f"FINDING 2 — Authentication Failures [{len(access_denied):,} events]")
-    sep2()
-    I(f"  Total access denied events : {len(access_denied):,}")
-    I("  By user:")
-    for u, c in ad_user_ctr.most_common():
-        disp = u if u else "(empty — anonymous)"
-        flag = "[KNOWN]" if u in BASELINE_USERS_2024 else (
-               "[UNKNOWN USER]" if u in SUSPICIOUS_USERS_2024 else
-               "[ANONYMOUS — no password]" if not u else "[CHECK]")
-        I(f"    '{disp}' : {c:,}  {flag}")
-    I("  By source host:")
-    for h, c in ad_host_ctr.most_common():
-        flag = "[BASELINE]" if h in BASELINE_HOSTS_2024 else "[NON-BASELINE]"
-        anom = "  ! CRITICAL ANOMALY" if h == "DUFUTH-SERVER" else ""
-        I(f"    '{h}' : {c:,}  {flag}{anom}")
-    L()
-    I("  DUFUTH-SERVER in 2024:")
-    I("    Jan-Mar 2024: heavy access denied (root3, ~6,900 events)")
-    I("    Apr-May 2024: tailing off + anonymous probes (password:NO)")
-    I("    After May 2024: access denied stops, aborted connections continue")
-    I("    Interpretation: IT partially fixed issue May 2024 but")
-    I("    DUFUTH still connecting = application not fully corrected")
-    L()
-
-    # Finding 3
-    I(f"FINDING 3 — Unauthenticated Connections [{len(unauth):,} real-host events]")
-    sep2()
-    I(f"  Plus 3,864 connecting-host events = R26 connection limit")
-    unauth_hosts = Counter(e["host"] for e in unauth if e["host"])
-    for h, c in unauth_hosts.most_common(8):
-        I(f"    '{h}' : {c:,}")
-    L()
-
-    # Finding 4 — Catastrophe
-    I("FINDING 4 — CATASTROPHIC DATABASE ABORT (2024-03-22) [CRITICAL]")
-    sep2()
-    I("  Sequence: ibdata1 not writable → InnoDB init failed →")
-    I("           Storage engine unavailable → Aborting")
-    I("  Time: 2024-03-22 13:19:28 — lasted ~33 seconds to abort")
-    I("  Manual IT intervention required to restore EMR access")
-    I("  This is the most severe single incident in the 2024 log")
-    I(f"  ERROR-level events: {error_cnt} (first in entire 2023-2026 dataset until this point)")
-    L()
-
-    # Finding 5 — Too many connections
-    I(f"FINDING 5 — Connection Limit Exhaustion [{len(r26_evts):,} events] (R26)")
-    sep2()
-    r26_months = Counter(e["month"] for e in r26_evts if e["month"])
-    I("  Monthly distribution of connection limit hits:")
-    for mo in month_order:
-        if mo in r26_months:
-            I(f"    {mo:<12}: {r26_months[mo]:,}")
-    I("  All 3,864 are from connecting host (EMR DB hit max_connections)")
-    L()
-
-    # Finding 6 — bamedstorage
-    bamed_storage_evts = [e for e in events if e.get("database") == "bamedstorage"]
-    if bamed_storage_evts:
-        I(f"FINDING 6 — SECONDARY DATABASE ACCESS (bamedstorage) [HIGH]")
-        sep2()
-        I(f"  1 event: BookingEnergy host accessed 'bamedstorage' database")
-        I(f"  Date: {bamed_storage_evts[0]['date']} at {bamed_storage_evts[0]['time']}")
-        I(f"  Result: Unknown error abort")
-        I(f"  Primary EMR database is 'bamed'. Access to 'bamedstorage'")
-        I(f"  is anomalous — this secondary database should be investigated.")
-        L()
-
-    # Finding 7 — IPv6
-    ipv6_hosts = Counter(e["host"] for e in ipv6_evts if e["host"])
-    I(f"FINDING 7 — Unregistered IPv6 Devices [{len(ipv6_hosts):,} unique addresses]")
-    sep2()
-    for h, c in ipv6_hosts.most_common(5):
-        I(f"  {h}  ({c:,} connections)")
-    if len(ipv6_hosts) > 5:
-        I(f"  ... and {len(ipv6_hosts)-5} more IPv6 addresses")
-    L()
-
-    # Finding 8 — After hours
-    I(f"FINDING 8 — After-Hours Incidents [{len(after_h_inc):,} events]")
-    sep2()
-    ah_hours = Counter(e["hour"] for e in after_h_inc if e["hour"] != -1)
-    for h, c in ah_hours.most_common(5):
-        I(f"  {h:02d}:xx  :  {c:,} incidents")
-
-    # ── SECTION 7: ABORT REASONS ───────────────────────────────────────
-    H("SECTION 7 — CONNECTION ABORT REASONS (2024)")
-    L()
-    I(f"  {'ABORT REASON':<52} {'COUNT':>8}")
-    I(f"  {'─'*52} {'─'*8}")
-    for reason, cnt in abort_ctr.most_common():
-        flag = "  [NEW IN 2024]" if reason in (
-            "Got an error writing communication packets",
-            "Unknown error",
-            "Query execution was interrupted",
-        ) else ""
-        I(f"  {reason:<52} {cnt:>8,}{flag}")
-
-    # ── SECTION 8: NETWORK PROFILE ─────────────────────────────────────
-    H("SECTION 8 — 2024 NETWORK PROFILE (All Connecting Hosts)")
-    L()
-    I(f"Total unique hosts : {len(host_ctr):,}")
-    I(f"  Baseline (>= 1%)         : {sum(1 for h in host_ctr if h in BASELINE_HOSTS_2024):,}")
-    I(f"  Non-baseline hostname    : {sum(1 for h in host_ctr if h in NON_BASELINE_HOSTS_2024):,}")
-    I(f"  IPv6 link-local          : {sum(1 for h in host_ctr if h and RE_IPV6.match(h)):,}")
-    I(f"  Raw IP addresses         : {sum(1 for h in host_ctr if h and RE_IPV4.match(h)):,}")
-    L()
-    I(f"  {'HOST':<36} {'CONNECTIONS':>12}  STATUS")
-    I(f"  {'─'*36} {'─'*12}  {'─'*18}")
-    for h, c in host_ctr.most_common():
-        if not h:
-            continue
-        if h in BASELINE_HOSTS_2024:        st = "✓ BASELINE"
-        elif h in NON_BASELINE_HOSTS_2024:  st = "◑ NON-BASELINE"
-        elif RE_IPV6.match(h):              st = "! IPv6 UNREGISTERED"
-        elif RE_IPV4.match(h):              st = "! RAW IP"
-        elif h == "connecting host":        st = "! MAX CONN SENTINEL"
-        else:                               st = "? UNKNOWN"
-        I(f"  {h:<36} {c:>12,}  {st}")
-
-    # ── SECTION 9: RULE ENGINE ─────────────────────────────────────────
-    H("SECTION 9 — LABELING RULE ENGINE — 2024 FIRING REPORT")
-    L()
-    I(f"  {'RULE':<6} {'DESCRIPTION':<46} {'FIRED':>8}  {'%':>7}")
-    I(f"  {'─'*6} {'─'*46} {'─'*8}  {'─'*7}")
-    for rid in sorted(rule_ctr.keys()):
-        cnt  = rule_ctr[rid]
-        pct  = cnt / total * 100
-        desc = RULE_CATALOG.get(rid, "Unknown")
-        new  = "  [2024 NEW]" if rid in ("R11C","R32","R33") else ""
-        I(f"  {rid:<6} {desc:<46} {cnt:>8,}  {pct:>6.2f}%{new}")
-    L()
-    unfired = [r for r in RULE_CATALOG if r not in rule_ctr]
-    I(f"Rules fired    : {len(rule_ctr)} of {len(RULE_CATALOG)} defined")
-    if unfired:
-        I("Rules not fired (patterns absent from 2024 log):")
-        for r in unfired:
-            I(f"  {r}  {RULE_CATALOG[r]}")
-
-    # ── SECTION 10: STARTUP CONTEXT VERIFICATION ──────────────────────
-    H("SECTION 10 — STARTUP CONTEXT VERIFICATION")
-    L()
-    for rule, kw in [
-        ("R09","rollback segments are active"),
-        ("R07","creating shared tablespace"),
-        ("R08","removed temporary tablespace"),
-    ]:
-        evts  = [e for e in events if kw in e["message"].lower()]
-        crash = sum(1 for e in evts if e["startup_context"]=="crash_startup"
-                    and e["label"]=="DATA_CORRUPTION")
-        clean = sum(1 for e in evts if e["startup_context"] in
-                    ("clean_startup","running","abort_startup")
-                    and e["label"]=="BENIGN")
-        total_r = len(evts)
-        ok = crash + clean == total_r
-        I(f"  {rule}: {crash} crash→DATA_CORRUPTION | {clean} non-crash→BENIGN "
-          f"| total={total_r}  [{'PASS' if ok else 'FAIL'}]")
-    L()
-    abort_ctx = [e for e in events if e["startup_context"] == "abort_startup"]
-    I(f"  abort_startup events: {len(abort_ctx)}")
-    I(f"  These are the 2024-03-22 catastrophe sequence events")
-    r28_in_abort = sum(1 for e in abort_ctx if e["rule_id"] in ("R28","R30","R31"))
-    I(f"  R28/R30/R31 fired in abort_startup context: {r28_in_abort}")
-
-    # ── SECTION 11: TEMPORAL DISTRIBUTION ─────────────────────────────
-    H("SECTION 11 — TEMPORAL DISTRIBUTION (2024)")
-    L()
-    I("Events by Hour of Day:")
-    inc_hour = Counter(e["hour"] for e in incidents if e["hour"] != -1)
-    I(f"  {'HOUR':<8} {'TOTAL':>8}  {'INCIDENTS':>10}  BAR")
-    I(f"  {'─'*8} {'─'*8}  {'─'*10}  {'─'*20}")
-    for h in range(24):
-        tot_h = hour_ctr.get(h, 0)
-        inc_h = inc_hour.get(h, 0)
-        bar   = "||" * min(20, inc_h // max(1, len(incidents)//20))
-        mark  = " ◄ WORK START" if h == WORK_START else (
-                " ◄ WORK END"   if h == WORK_END   else "")
-        I(f"  {h:02d}:xx  {tot_h:>8,}  {inc_h:>10,}  {bar}{mark}")
-    L()
-    I("Events by Day of Week:")
-    inc_dow = Counter(e["day_of_week"] for e in incidents if e["day_of_week"])
-    for day in ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]:
-        tot = dow_ctr.get(day, 0)
-        inc = inc_dow.get(day, 0)
-        I(f"  {day:<12} {tot:>7,} total  {inc:>6,} incidents")
-
-    # ── FOOTER ────────────────────────────────────────────────────────
-    SEP()
-    L(f"{'LIRA — 2024 Dedicated Parser  v1.0':^{W}}")
-    L(f"{'All values auto-generated from parsed 2024 log data':^{W}}")
-    L(f"{'Report generated: ' + end_dt.strftime('%Y-%m-%d %H:%M:%S'):^{W}}")
-    SEP()
-
-    return "\n".join(lines)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════
-
-def main():
-    ap = argparse.ArgumentParser(
-        description="LIRA 2024 Dedicated Log Parser — PhD ESUTH EMR Research"
-    )
-    ap.add_argument("--input",  "-i", required=True,
-        help="Path to log_031214_2024.txt")
-    ap.add_argument("--output", "-o", default=None,
-        help="Output directory (default: LIRA_2024_Output/ next to input)")
-    args = ap.parse_args()
-
-    input_path = args.input
-    out_dir    = args.output or os.path.join(
-        os.path.dirname(os.path.abspath(input_path)), "LIRA_2024_Output"
-    )
-    os.makedirs(out_dir, exist_ok=True)
-    start_dt = datetime.now()
-
-    print()
-    print("|" + "═"*66 + "╗")
-    print("||" + f"  {TOOL_NAME}  v{TOOL_VERSION}".ljust(66) + "||")
-    print("||" + "  PhD Research — ESUTH EMR Incident Response System".ljust(66) + "||")
-    print("||" + "═"*66 + "╝")
-    print()
-    print(f"  Input  : {input_path}")
-    print(f"  Output : {out_dir}")
-    print()
-
-    print("  [1/6] Parsing 2024 log file...")
-    events, raw_lines, skipped, file_size = parse_log(input_path)
-    print(f"        {len(events):,} events from {raw_lines:,} lines  "
-          f"(skipped {skipped:,} continuation lines)")
-
-    print("  [2/6] Assigning startup context...")
-    events = assign_startup_context(events)
-    ctx_dist = Counter(e["startup_context"] for e in events)
-    crash_sess = len(set(e["startup_session_id"] for e in events
-                         if e["startup_context"] == "crash_startup"))
-    clean_sess = len(set(e["startup_session_id"] for e in events
-                         if e["startup_context"] == "clean_startup"))
-    abort_sess = len(set(e["startup_session_id"] for e in events
-                         if e["startup_context"] == "abort_startup"))
-    print(f"        crash_startup sessions : {crash_sess}")
-    print(f"        clean_startup sessions : {clean_sess}")
-    print(f"        abort_startup sessions : {abort_sess}  "
-          f"(2024-03-22 catastrophe)")
-
-    print("  [3/6] Applying 2024 labeling rules...")
-    events = [label_event(e) for e in events]
-    label_dist = Counter(e["label"] for e in events)
-    for lb, cnt in sorted(label_dist.items(), key=lambda x: -x[1]):
-        print(f"        {lb:<28} {cnt:>8,} events")
-
-    print("  [4/6] Building downtime sessions...")
-    sessions = build_sessions(events)
-    print(f"        {len(sessions):,} complete crash-recovery sessions")
-
-    print("  [5/6] Writing output CSV files...")
-    incidents   = [e for e in events if e["is_incident"] == "1"]
-    downtime_ev = [e for e in events if "downtime_events"    in e["model_flags"]]
-    corrupt_ev  = [e for e in events if "data_corruption"     in e["model_flags"]]
-    unauth_ev   = [e for e in events if "unauthorized_access" in e["model_flags"]]
-    suspect_ev  = [e for e in events if "suspicious_review"   in e["model_flags"]]
-
-    audit = [{
-        "event_id":          e["event_id"],
-        "fingerprint":       e["fingerprint"],
-        "source_line":       e["source_line"],
-        "timestamp":         e["timestamp"],
-        "level":             e["level"],
-        "startup_context":   e["startup_context"],
-        "rule_id":           e["rule_id"],
-        "rule_description":  e["rule_description"],
-        "label":             e["label"],
-        "sublabel":          e["sublabel"],
-        "severity":          e["severity"],
-        "confidence":        e["confidence"],
-        "is_incident":       e["is_incident"],
-        "is_after_hours":    e["is_after_hours"],
-        "model_flags":       e["model_flags"],
-        "host_class":        e["host_class"],
-        "user_class":        e["user_class"],
-        "user":              e["user"],
-        "host":              e["host"],
-        "database":          e["database"],
-        "message_preview":   e["message"][:120],
-        "analyst_notes":     e["analyst_notes"],
-    } for e in events]
-
-    file_plan = {
-        "LIRA_2024_00_master_all_events.csv":         events,
-        "LIRA_2024_01_incidents_only.csv":            incidents,
-        "LIRA_2024_02_model_downtime_events.csv":     downtime_ev,
-        "LIRA_2024_03_model_downtime_sessions.csv":   sessions,
-        "LIRA_2024_04_model_data_corruption.csv":     corrupt_ev,
-        "LIRA_2024_05_model_unauthorized_access.csv": unauth_ev,
-        "LIRA_2024_06_model_suspicious_review.csv":   suspect_ev,
-        "LIRA_2024_07_label_audit_trail.csv":         audit,
-    }
-
-    out_files = {}
-    for fname, data in file_plan.items():
-        fpath       = os.path.join(out_dir, fname)
-        meta        = write_csv(data, fpath)
-        out_files[fname] = meta
-        print(f"        {fname:<48} {meta['rows']:>7,} rows  {hs(meta['size']):>20}")
-
-    print("  [6/6] Generating 2024 analysis report...")
-    report = generate_report(
-        events, sessions, input_path, file_size,
-        raw_lines, skipped, out_files, out_dir, start_dt
-    )
-    rpath = os.path.join(out_dir, "LIRA_2024_REPORT.txt")
-    with open(rpath, "w", encoding="utf-8") as f:
-        f.write(report)
-    rep_size = os.path.getsize(rpath)
-    print(f"        {'LIRA_2024_REPORT.txt':<48} {'report':>7}       {hs(rep_size):>20}")
-
-    elapsed   = (datetime.now() - start_dt).total_seconds()
-    total_out = sum(m["size"] for m in out_files.values()) + rep_size
-
-    print()
-    print("  |" + "═"*60 + "╗")
-    print("  ||" + "  LIRA 2024 PROCESSING COMPLETE".ljust(60) + "||")
-    print("  ||" + "═"*60 + "╣")
-    print("  ||" + f"  Events parsed            : {len(events):,}".ljust(60) + "||")
-    print("  ||" + f"  Incident events          : {len(incidents):,}".ljust(60) + "||")
-    print("  ||" + f"  Benign events            : {len(events)-len(incidents):,}".ljust(60) + "||")
-    print("  ||" + f"  Downtime sessions        : {len(sessions):,}".ljust(60) + "||")
-    print("  ||" + f"  Total output size        : {hs(total_out)}".ljust(60) + "||")
-    print("  ||" + f"  Processing time          : {elapsed:.2f} seconds".ljust(60) + "||")
-    print("  ||" + "═"*60 + "╝")
-    print()
-
-
-if __name__ == "__main__":
-    main()

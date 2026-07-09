@@ -14,18 +14,6 @@ from datetime import datetime
 from collections import Counter
 
 
-# ───────────────────────────────────────────────────────────────────────
-TOOL_NAME    = "LIRA — 2025 Dedicated Log Parser"
-TOOL_VERSION = "1.0"
-HOSPITAL     = "Enugu State University Teaching Hospital (ESUTH)"
-PRIMARY_DB   = "bamed"
-WORK_START   = 7
-WORK_END     = 21
-SEVERITY_W   = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
-
-# ───────────────────────────────────────────────────────────────────────
-# 2025 CONFIRMED BASELINE (>= 1,150 connections = 1% of ~115,000)
-# ───────────────────────────────────────────────────────────────────────
 BASELINE_USERS = {"root3"}
 
 BASELINE_HOSTS = {
@@ -937,18 +925,7 @@ def main():
 
     elapsed = (datetime.now()-start_dt).total_seconds()
     total_out = sum(m["size"] for m in out_files.values()) + rep_size
-    print()
-    print("  ||"+"═"*58+"╗")
-    print("  ||"+"  LIRA 2025 PROCESSING COMPLETE".ljust(58)+"||")
-    print("  ||"+"═"*58+"╣")
-    print("  ||"+f"  Events parsed          : {len(events):,}".ljust(58)+"||")
-    print("  ||"+f"  Incident events        : {len(incidents):,}".ljust(58)+"||")
-    print("  ||"+f"  Benign events          : {len(events)-len(incidents):,}".ljust(58)+"||")
-    print("  ||"+f"  Downtime sessions      : {len(sessions):,}".ljust(58)+"||")
-    print("  ||"+f"  Total output size      : {hs(total_out)}".ljust(58)+"||")
-    print("  ||"+f"  Processing time        : {elapsed:.2f} seconds".ljust(58)+"||")
-    print("  ||"+"═"*58+"╝")
-    print()
+ 
 
 if __name__ == "__main__":
     main()

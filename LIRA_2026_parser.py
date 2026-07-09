@@ -26,81 +26,81 @@ SEVERITY_W   = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
 
 BASELINE_USERS = {"root3"}
 
-# Hosts with >= 226 connections confirmed in 2026 file
+
 BASELINE_HOSTS = {
-    "DESKTOP-EE1TUR0",    # 3,477
-    "Emergency-Phamarcy", # 2,301
-    "A-E-BILLING",        # 1,256
-    "HOU-REVENUE-PC",     # 989
-    "DESKTOP-6UQ9AGN",    # 965
-    "DESKTOP-CSPRMLA",    # 961  *** NEW in 2026 ***
-    "DESKTOP-20DMDI8",    # 730
-    "DESKTOP-B8CCP1M",    # 667  *** NEW in 2026 ***
-    "DESKTOP-VLAGG25",    # 657
-    "Med-Records-1",      # 651
-    "DESKTOP-H0VKHI9",   # 642
-    "GOPD-Revenue",       # 600
-    "DESKTOP-7T7ELOQ",   # 547
-    "DESKTOP-0UKNV7K",   # 530
-    "DESKTOP-17O6HNS",   # 506
-    "DESKTOP-7B1UJP6",   # 477
-    "DESKTOP-BEFTIQ9",   # 450
-    "DESKTOP-VBC03FI",   # 429
-    "DESKTOP-SMITJEQ",   # 428  *** NEW in 2026 ***
-    "A-E-REVENUE",        # 373
-    "DESKTOP-KSOTEUC",   # 369
-    "DESKTOP-NE61ATE",   # 361
-    "DESKTOP-STLV8TP",   # 342
-    "DESKTOP-S50VKNJ",   # 267
-    "DESKTOP-45HCUFT",   # 246
-    "DESKTOP-NSBN0U7",   # 236
-    "DESKTOP-4KC70RJ",   # 236
+    "DESKTOP-EE1TUR0",    
+    "Emergency-Phamarcy", 
+    "A-E-BILLING",        
+    "HOU-REVENUE-PC",     
+    "DESKTOP-6UQ9AGN",    
+    "DESKTOP-CSPRMLA",    
+    "DESKTOP-20DMDI8",    
+    "DESKTOP-B8CCP1M",    
+    "DESKTOP-VLAGG25",   
+    "Med-Records-1",      
+    "DESKTOP-H0VKHI9",   
+    "GOPD-Revenue",       
+    "DESKTOP-7T7ELOQ",   
+    "DESKTOP-0UKNV7K",   
+    "DESKTOP-17O6HNS",   
+    "DESKTOP-7B1UJP6",   
+    "DESKTOP-BEFTIQ9",   
+    "DESKTOP-VBC03FI",   
+    "DESKTOP-SMITJEQ",   
+    "A-E-REVENUE",        
+    "DESKTOP-KSOTEUC",   
+    "DESKTOP-NE61ATE",   
+    "DESKTOP-STLV8TP",   
+    "DESKTOP-S50VKNJ",   
+    "DESKTOP-45HCUFT",   
+    "DESKTOP-NSBN0U7",   
+    "DESKTOP-4KC70RJ",   
 }
 
-# Non-baseline known hospital hosts (below 226 threshold)
+
 NON_BASELINE_HOSTS = {
-    "DESKTOP-30R3R26",   # 225 (just below)
-    "fe80::6063:7357:e409:6d46%27",  # NOT here — handled as IPv6
-    "DESKTOP-ILTBA5K",   # 147
-    "DESKTOP-TBENMV8",   # 141
-    "DESKTOP-QT13QIF",   # 113
-    "DESKTOP-1CDJVE5",    # 99
-    "DESKTOP-RH8L10S",    # 71
-    "DUFUTH-SERVER",      # 162 — below threshold, fully benign in 2026
-    "DESKTOP-SR7S8JA",    # 46
-    "DESKTOP-7GDKJ9T",   # 53
-    "DESKTOP-3JNEPMU",   # 23
-    "DESKTOP-NVOCDLO",   # 19
-    "DESKTOP-LBBGMPQ",   # 19
-    "DESKTOP-LTQ7H5P",    # 7
-    "DESKTOP-HG3HT3A",    # 7
-    "DESKTOP-25O5OPP",    # 5
-    "DESKTOP-UOEFDLJ",    # 2
-    "DESKTOP-21QT7E9",    # 2
+    "DESKTOP-30R3R26",   
+    "fe80::6063:7357:e409:6d46%27",  
+    "DESKTOP-ILTBA5K",   
+    "DESKTOP-TBENMV8",   
+    "DESKTOP-QT13QIF",   
+    "DESKTOP-1CDJVE5",   
+    "DESKTOP-RH8L10S",   
+    "DUFUTH-SERVER",      
+    "DESKTOP-SR7S8JA",    
+    "DESKTOP-7GDKJ9T",  
+    "DESKTOP-3JNEPMU",   
+    "DESKTOP-NVOCDLO",   
+    "DESKTOP-LBBGMPQ",   
+    "DESKTOP-LTQ7H5P",    
+    "DESKTOP-HG3HT3A",    
+    "DESKTOP-25O5OPP",   
+    "DESKTOP-UOEFDLJ",    
+    "DESKTOP-21QT7E9",   
 }
 
-# 17 IPv6 link-local addresses confirmed in 2026 file
+
 IPV6_HOSTS = {
-    "fe80::6063:7357:e409:6d46%27",   # 374 — top source (also unauthenticated)
-    "fe80::7483:f083:735:e9e7%27",    # 329
-    "fe80::2422:9959:1987:7801%27",   # 115
-    "fe80::bed3:e534:d8de:e7dd%27",   # 60
-    "fe80::4da7:981d:da2:8b7e%27",   # 59
-    "fe80::b667:6246:3acb:3a82%27",   # 32
-    "fe80::5e75:8fac:567d:a2c5%27",   # 17
-    "fe80::c0d3:80e2:90b:fd23%27",    # 15
-    "fe80::5290:9286:20f2:19d6%27",   # 14
-    "fe80::9e21:a674:c3d3:7acd%27",   # 10
-    "fe80::3324:82b0:33d3:9f60%27",   # 10
-    "fe80::ed74:7f9c:d3e0:7b95%27",   # 9
-    "fe80::ec03:48e9:d6ec:7d23%27",   # 7
-    "fe80::a917:633d:15cc:111a%27",   # 7
-    "fe80::3438:f8ca:8641:32dd%27",   # 6
-    "fe80::672c:77fe:a1e7:548b%27",   # 5
-    "fe80::25e7:988:8e8d:5d78%27",    # 1
+    "fe80::6063:7357:e409:6d46%27",   
+    "fe80::7483:f083:735:e9e7%27",    
+    "fe80::2422:9959:1987:7801%27",   
+    "fe80::bed3:e534:d8de:e7dd%27",   
+    "fe80::4da7:981d:da2:8b7e%27",  
+    "fe80::b667:6246:3acb:3a82%27",  
+    "fe80::5e75:8fac:567d:a2c5%27",   
+    "fe80::c0d3:80e2:90b:fd23%27",    
+    "fe80::5290:9286:20f2:19d6%27",   
+    "fe80::9e21:a674:c3d3:7acd%27",   
+    "fe80::3324:82b0:33d3:9f60%27",   
+    "fe80::ed74:7f9c:d3e0:7b95%27",   
+    "fe80::ec03:48e9:d6ec:7d23%27",   
+    "fe80::a917:633d:15cc:111a%27",  
+    "fe80::3438:f8ca:8641:32dd%27",   
+    "fe80::672c:77fe:a1e7:548b%27",   
+    "fe80::25e7:988:8e8d:5d78%27",    
 }
 
-# Raw IPs confirmed in 2026 host field
+
 RAW_IP_HOSTS = {"10.5.50.249"}
 
 RULE_CATALOG = {
@@ -150,10 +150,6 @@ RE_IPV4 = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
 RE_IPV6 = re.compile(r'^fe80::')
 
 
-# ───────────────────────────────────────────────────────────────────────
-# PASS 1b — STARTUP CONTEXT
-# crash_startup / clean_startup / running (no abort_startup in 2026)
-# ───────────────────────────────────────────────────────────────────────
 def assign_startup_context(events):
     for e in events:
         e["startup_context"] = "running"
@@ -203,9 +199,7 @@ def assign_startup_context(events):
     return events
 
 
-# ───────────────────────────────────────────────────────────────────────
-# PASS 1 — PARSER
-# ───────────────────────────────────────────────────────────────────────
+
 def parse_log(filepath):
     events = []
     raw_lines = 0
@@ -334,7 +328,7 @@ def label_event(event):
     label = "BENIGN"; sublabel = "general_informational"; severity = "INFO"
     rule_id = "R24"; models = []; confidence = "HIGH"; notes = ""
 
-    # ── BLOCK A: DOWNTIME ──────────────────────────────────────────────
+   
     if "innodb: starting crash recovery" in msg:
         label="SYSTEM_DOWNTIME"; sublabel="innodb_crash_recovery"; severity="CRITICAL"
         rule_id="R01"; models=["downtime_events","data_corruption"]
@@ -373,8 +367,7 @@ def label_event(event):
         notes="Authorized shutdown sub-sequence. Benign."
 
     elif "table cache mutex contention" in msg:
-        # R27: Note level (consistent with 2024 and 2025). 17 events in 2026
-        # (Jan: 7, Feb: 10) — worsening trend vs 9 in 2025 full year.
+      
         label="SYSTEM_DOWNTIME"; sublabel="table_cache_mutex_contention_performance_degradation"
         severity="MEDIUM"; rule_id="R27"; models=["downtime_events"]
         notes=("Table cache mutex contention. 17 events Jan-Feb 2026 already — "
@@ -382,7 +375,7 @@ def label_event(event):
                "Query slowdowns affecting all hospital workstations simultaneously. "
                "table_open_cache remains undersized for growing EMR load.")
 
-    # ── BLOCK B: DATA CORRUPTION (context-dependent) ───────────────────
+   
     elif "creating shared tablespace for temporary tables" in msg:
         if ctx == "crash_startup":
             label="DATA_CORRUPTION"; sublabel="temp_tablespace_recreated_post_crash"
@@ -414,9 +407,7 @@ def label_event(event):
    
 
     elif "closed normally without authentication" in ar:
-        # R13: connection closed without auth — from any host type (incl. IPv6)
-        # In 2026: fe80::6063:: makes some of these. IPv6 + no-auth is
-        # still a closed-without-auth event, so R13 is the correct label.
+      
         label="UNAUTHORIZED_ACCESS"; sublabel="connection_closed_without_authentication"
         severity="HIGH"; rule_id="R13"; models=["unauthorized_access"]
         notes=(f"Connection from '{host}' closed before auth completed "
@@ -425,8 +416,7 @@ def label_event(event):
                "fe80::6063:7357:e409:6d46%27 — unregistered device probing the DB.")
 
     elif hc == "ipv6_unregistered":
-        # R14: IPv6 link-local unregistered device — includes unauthenticated
-        # IPv6 connections that did NOT close normally (covered above by R13).
+       
         label="SUSPICIOUS"; sublabel="connection_from_ipv6_link_local_unregistered_device"
         severity="HIGH"; rule_id="R14"; models=["unauthorized_access","suspicious_review"]
         confidence="MEDIUM"
@@ -438,7 +428,7 @@ def label_event(event):
                "an unregistered device actively probing the database.")
 
     elif hc == "raw_ip":
-        # R15: Raw IP in host field — 10.5.50.249 (6 events, root3, bamed)
+       
         label="SUSPICIOUS"; sublabel="connection_from_raw_ip_no_hostname"
         severity="HIGH"; rule_id="R15"; models=["unauthorized_access","suspicious_review"]
         confidence="MEDIUM"
@@ -448,8 +438,7 @@ def label_event(event):
                "hostname-based controls.")
 
     elif uc == "unauthenticated":
-        # R10: unauthenticated from real named hosts (non-IPv6, non-closed-normally)
-        # In 2026: DESKTOP-EE1TUR0 (26), DESKTOP-20DMDI8 (6), etc.
+      
         label="UNAUTHORIZED_ACCESS"; sublabel="unauthenticated_connection_real_host"
         severity="CRITICAL"; rule_id="R10"; models=["unauthorized_access"]
         notes=(f"Authentication never completed from '{host}'. "
@@ -507,7 +496,7 @@ def label_event(event):
         label="BENIGN"; sublabel="system_internal_connection"; severity="INFO"
         rule_id="R24"; notes="Internal system connection. Benign."
 
-    # ── BLOCK D: BENIGN OPERATIONAL ────────────────────────────────────
+    
     elif "buffer pool" in msg:
         label="BENIGN"; sublabel="innodb_buffer_pool_management"; severity="INFO"
         rule_id="R21"; notes="InnoDB buffer pool management. Routine."
@@ -1008,19 +997,7 @@ def main():
 
     elapsed   = (datetime.now()-start_dt).total_seconds()
     total_out = sum(m["size"] for m in out_files.values()) + rep_size
-    print()
-    print("  ||"+"═"*58+"╗")
-    print("  ||"+"  LIRA 2026 PROCESSING COMPLETE".ljust(58)+"||")
-    print("  ╠"+"═"*58+"╣")
-    print("  ||"+f"  Period                 : Jan 1 – Mar 23 2026 (82 days)".ljust(58)+"||")
-    print("  ||"+f"  Events parsed          : {len(events):,}".ljust(58)+"||")
-    print("  ||"+f"  Incident events        : {len(incidents):,}".ljust(58)+"||")
-    print("  ||"+f"  Benign events          : {len(events)-len(incidents):,}".ljust(58)+"||")
-    print("  ||"+f"  Downtime sessions      : {len(sessions):,}".ljust(58)+"||")
-    print("  ||"+f"  Total output size      : {hs(total_out)}".ljust(58)+"||")
-    print("  ||"+f"  Processing time        : {elapsed:.2f} seconds".ljust(58)+"||")
-    print("  ||"+"═"*58+"╝")
-    print()
+    
 
 if __name__ == "__main__":
     main()
